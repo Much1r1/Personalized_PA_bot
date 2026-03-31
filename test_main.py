@@ -25,33 +25,36 @@ async def async_client():
 
 @pytest.mark.anyio
 @patch("main.openai_client.chat.completions.create")
+@patch("main.genai.GenerativeModel")
 @patch("main.supabase.table")
 @patch("main.send_telegram_draft")
 @patch("main.send_telegram_message")
-async def test_telegram_webhook_full_cycle(mock_send_msg, mock_send_draft, mock_supabase, mock_openai, async_client):
+async def test_telegram_webhook_full_cycle(mock_send_msg, mock_send_draft, mock_supabase, mock_gemini, mock_openai, async_client):
     # 1. Mock OpenAI Intent Classification
     mock_intent_response = MagicMock()
     mock_intent_response.choices = [
         MagicMock(message=MagicMock(content='{"category": "Build Mode", "content": "FastAPI testing"}'))
     ]
+    mock_openai.return_value = AsyncMock(return_value=mock_intent_response)()
 
-    # 2. Mock OpenAI Chat Completion (Streaming)
+    # 2. Mock Gemini Chat Completion (Streaming)
+    mock_model = MagicMock()
+    mock_gemini.return_value = mock_model
+    mock_chat = MagicMock()
+    mock_model.start_chat.return_value = mock_chat
+
     mock_chunk1 = MagicMock()
-    mock_chunk1.choices = [MagicMock(delta=MagicMock(content="Hello "))]
+    mock_chunk1.text = "Hello "
     mock_chunk2 = MagicMock()
-    mock_chunk2.choices = [MagicMock(delta=MagicMock(content="world!"))]
+    mock_chunk2.text = "world!"
 
-    async def mock_stream(*args, **kwargs):
-        if kwargs.get("response_format") == {"type": "json_object"}:
-            return mock_intent_response
-
-        # Generator for streaming
+    async def mock_send_message_async(*args, **kwargs):
         async def gen():
             yield mock_chunk1
             yield mock_chunk2
         return gen()
 
-    mock_openai.side_effect = mock_stream
+    mock_chat.send_message_async.side_effect = mock_send_message_async
 
     # 3. Mock Supabase
     mock_table = MagicMock()
@@ -88,28 +91,33 @@ async def test_telegram_webhook_full_cycle(mock_send_msg, mock_send_draft, mock_
 
 @pytest.mark.anyio
 @patch("main.openai_client.chat.completions.create")
+@patch("main.genai.GenerativeModel")
 @patch("main.supabase.table")
 @patch("main.send_telegram_draft")
 @patch("main.send_telegram_message")
-async def test_telegram_webhook_project_zayn(mock_send_msg, mock_send_draft, mock_supabase, mock_openai, async_client):
+async def test_telegram_webhook_project_zayn(mock_send_msg, mock_send_draft, mock_supabase, mock_gemini, mock_openai, async_client):
     # 1. Mock OpenAI Intent Classification
     mock_intent_response = MagicMock()
     mock_intent_response.choices = [
         MagicMock(message=MagicMock(content='{"category": "Project Zayn", "skincare_done": true, "workout_done": false, "content": "Skincare done"}'))
     ]
+    mock_openai.return_value = AsyncMock(return_value=mock_intent_response)()
 
-    # 2. Mock OpenAI Chat Completion (Streaming)
+    # 2. Mock Gemini Chat Completion (Streaming)
+    mock_model = MagicMock()
+    mock_gemini.return_value = mock_model
+    mock_chat = MagicMock()
+    mock_model.start_chat.return_value = mock_chat
+
     mock_chunk1 = MagicMock()
-    mock_chunk1.choices = [MagicMock(delta=MagicMock(content="Logged your skincare!"))]
+    mock_chunk1.text = "Logged your skincare!"
 
-    async def mock_stream(*args, **kwargs):
-        if kwargs.get("response_format") == {"type": "json_object"}:
-            return mock_intent_response
+    async def mock_send_message_async(*args, **kwargs):
         async def gen():
             yield mock_chunk1
         return gen()
 
-    mock_openai.side_effect = mock_stream
+    mock_chat.send_message_async.side_effect = mock_send_message_async
 
     # 3. Mock Supabase
     mock_table = MagicMock()

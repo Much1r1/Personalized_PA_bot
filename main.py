@@ -2,12 +2,13 @@ import os
 import json
 from typing import Optional, List, Dict, Any
 from contextvars import ContextVar
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
 from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel
 from openai import AsyncOpenAI
 from supabase import create_client, Client
 import httpx
+import google.generativeai as genai
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -17,11 +18,15 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
 
 # Initialize Clients
 app = FastAPI(title="M-bot")
 openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+# Initialize Gemini
+genai.configure(api_key=GEMINI_API_KEY)
 
 # Context variable to store chat_id for LLM streaming response
 current_chat_id: ContextVar[int] = ContextVar("current_chat_id")
@@ -99,7 +104,7 @@ async def store_dev_milestone(category: str, data: Dict[str, Any]):
 
 async def fetch_chat_history(chat_id: int) -> List[Dict[str, str]]:
     """
-    Fetch the last 5 messages for the current chat_id from Supabase.
+    Fetch the last 15 messages for the current chat_id from Supabase.
     """
     try:
         response = await run_in_threadpool(
@@ -107,7 +112,7 @@ async def fetch_chat_history(chat_id: int) -> List[Dict[str, str]]:
             .select("role", "content")
             .eq("chat_id", chat_id)
             .order("created_at", desc=True)
-            .limit(5)
+            .limit(15)
             .execute()
         )
         # The response is in reverse chronological order, LLM needs it in chronological order.
@@ -148,31 +153,39 @@ async def send_telegram_draft(chat_id: int, text: str):
 
 async def get_llm_response(prompt: str) -> str:
     """
-    Get response from OpenAI with streaming and native Telegram animation.
+    Get response from Gemini 2.5 Flash with streaming and native Telegram animation.
     """
     chat_id = current_chat_id.get()
     history = await fetch_chat_history(chat_id)
 
-    messages = [{"role": "system", "content": "You are M-bot, a helpful personal AI PA."}]
-    for msg in history:
-        messages.append({"role": msg["role"], "content": msg["content"]})
-    messages.append({"role": "user", "content": prompt})
-
-    response_stream = await openai_client.chat.completions.create(
-        model="gpt-4o",
-        messages=messages,
-        stream=True
+    # System Instructions
+    system_instruction = (
+        "You are M-bot, Muchiri's personalized AI personal assistant. "
+        "You help with AI engineering, dev milestones, health tracking (Project Zayn), "
+        "and technical notes (Build Mode). Be concise, technical, and helpful."
     )
+
+    model = genai.GenerativeModel(
+        model_name="gemini-2.5-flash",
+        system_instruction=system_instruction
+    )
+
+    # Map history: Supabase (user/assistant) -> Gemini (user/model)
+    gemini_history = []
+    for msg in history:
+        role = "user" if msg["role"] == "user" else "model"
+        gemini_history.append({"role": role, "parts": [msg["content"]]})
+
+    chat = model.start_chat(history=gemini_history)
+    response_stream = await chat.send_message_async(prompt, stream=True)
 
     full_response = ""
     last_sent_response = ""
 
     async for chunk in response_stream:
-        if chunk.choices[0].delta.content:
-            full_response += chunk.choices[0].delta.content
-            # To avoid hitting Telegram rate limits, we could throttle here,
-            # but sendMessageDraft is designed for frequent updates.
-            # Let's send an update every time we have significant new content or periodically.
+        if chunk.text:
+            full_response += chunk.text
+            # Use sendMessageDraft for "real-time" typing animation
             if len(full_response) - len(last_sent_response) > 10:
                 await send_telegram_draft(chat_id, full_response)
                 last_sent_response = full_response
@@ -182,7 +195,7 @@ async def get_llm_response(prompt: str) -> str:
     return full_response
 
 @app.post("/webhook")
-async def telegram_webhook(request: Request):
+async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
     """
     Handle incoming Telegram updates.
     """
@@ -211,10 +224,9 @@ async def telegram_webhook(request: Request):
         # 3. Generate LLM response (this includes fetching history)
         full_response = await get_llm_response(text)
 
-        # 4. Store user message and assistant response in Supabase
-        # As per requirement: "After the LLM responds, store both the user's message and the assistant's response"
-        await store_message(chat_id, "user", text)
-        await store_message(chat_id, "assistant", full_response)
+        # 4. Store user message and assistant response in Supabase (Background Task)
+        background_tasks.add_task(store_message, chat_id, "user", text)
+        background_tasks.add_task(store_message, chat_id, "assistant", full_response)
 
         return {"status": "success", "category": category}
 
