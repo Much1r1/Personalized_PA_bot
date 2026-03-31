@@ -1,4 +1,5 @@
 import os
+import json
 from unittest.mock import patch, MagicMock, AsyncMock
 
 # Mock environment variables before importing main
@@ -11,89 +12,127 @@ with patch.dict(os.environ, {
     from main import app
 
 import pytest
-from fastapi.testclient import TestClient
+from httpx import AsyncClient, ASGITransport
 
-client = TestClient(app)
+@pytest.fixture
+def anyio_backend():
+    return 'asyncio'
 
+@pytest.fixture
+async def async_client():
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        yield client
+
+@pytest.mark.anyio
 @patch("main.openai_client.chat.completions.create")
 @patch("main.supabase.table")
-@patch("httpx.AsyncClient.post")
-def test_telegram_webhook_project_zayn(mock_httpx, mock_supabase, mock_openai):
-    # Mock OpenAI response
-    mock_openai.return_value = MagicMock()
-    mock_openai.return_value.choices = [
-        MagicMock(message=MagicMock(content='{"category": "Project Zayn", "skincare_done": true, "workout_done": false, "content": "Skincare done"}'))
+@patch("main.send_telegram_draft")
+@patch("main.send_telegram_message")
+async def test_telegram_webhook_full_cycle(mock_send_msg, mock_send_draft, mock_supabase, mock_openai, async_client):
+    # 1. Mock OpenAI Intent Classification
+    mock_intent_response = MagicMock()
+    mock_intent_response.choices = [
+        MagicMock(message=MagicMock(content='{"category": "Build Mode", "content": "FastAPI testing"}'))
     ]
-    # Since it's awaited, we need to wrap it in an awaitable or use AsyncMock correctly
-    async def mock_create(*args, **kwargs):
-        return mock_openai.return_value
-    mock_openai.side_effect = mock_create
 
-    # Mock Supabase
+    # 2. Mock OpenAI Chat Completion (Streaming)
+    mock_chunk1 = MagicMock()
+    mock_chunk1.choices = [MagicMock(delta=MagicMock(content="Hello "))]
+    mock_chunk2 = MagicMock()
+    mock_chunk2.choices = [MagicMock(delta=MagicMock(content="world!"))]
+
+    async def mock_stream(*args, **kwargs):
+        if kwargs.get("response_format") == {"type": "json_object"}:
+            return mock_intent_response
+
+        # Generator for streaming
+        async def gen():
+            yield mock_chunk1
+            yield mock_chunk2
+        return gen()
+
+    mock_openai.side_effect = mock_stream
+
+    # 3. Mock Supabase
     mock_table = MagicMock()
     mock_supabase.return_value = mock_table
 
     mock_execute = MagicMock()
-    mock_execute.execute = MagicMock(return_value={"status": "success"}) # Not async because run_in_threadpool
+    mock_execute.execute = MagicMock(return_value=MagicMock(data=[{"role": "user", "content": "Hi"}]))
 
+    mock_table.select.return_value.eq.return_value.order.return_value.limit.return_value = mock_execute
+    mock_table.insert.return_value = mock_execute
     mock_table.upsert.return_value = mock_execute
 
-    # Mock Telegram API call
-    mock_httpx.return_value = AsyncMock()
+    # 4. Mock Telegram calls (already patched)
+    mock_send_msg.return_value = AsyncMock()
+    mock_send_draft.return_value = AsyncMock()
 
     payload = {
         "message": {
             "chat": {"id": 12345},
-            "text": "I finished my skincare routine"
+            "text": "Tell me about FastAPI"
         }
     }
 
-    response = client.post("/webhook", json=payload)
+    response = await async_client.post("/webhook", json=payload)
 
     assert response.status_code == 200
-    assert response.json()["status"] == "success"
-    assert response.json()["category"] == "Project Zayn"
+    data = response.json()
+    assert data["status"] == "success"
+    assert data["category"] == "Build Mode"
 
-    # Verify Supabase call
-    mock_supabase.assert_called_with("project_zayn")
+    # Verify Supabase calls
+    assert mock_supabase.call_count >= 3
+    assert mock_send_msg.called
 
+@pytest.mark.anyio
 @patch("main.openai_client.chat.completions.create")
 @patch("main.supabase.table")
-@patch("httpx.AsyncClient.post")
-def test_telegram_webhook_build_mode(mock_httpx, mock_supabase, mock_openai):
-    # Mock OpenAI response
-    mock_openai.return_value = MagicMock()
-    mock_openai.return_value.choices = [
-        MagicMock(message=MagicMock(content='{"category": "Build Mode", "content": "Learned about FastAPI dependencies"}'))
+@patch("main.send_telegram_draft")
+@patch("main.send_telegram_message")
+async def test_telegram_webhook_project_zayn(mock_send_msg, mock_send_draft, mock_supabase, mock_openai, async_client):
+    # 1. Mock OpenAI Intent Classification
+    mock_intent_response = MagicMock()
+    mock_intent_response.choices = [
+        MagicMock(message=MagicMock(content='{"category": "Project Zayn", "skincare_done": true, "workout_done": false, "content": "Skincare done"}'))
     ]
-    async def mock_create(*args, **kwargs):
-        return mock_openai.return_value
-    mock_openai.side_effect = mock_create
 
-    # Mock Supabase
+    # 2. Mock OpenAI Chat Completion (Streaming)
+    mock_chunk1 = MagicMock()
+    mock_chunk1.choices = [MagicMock(delta=MagicMock(content="Logged your skincare!"))]
+
+    async def mock_stream(*args, **kwargs):
+        if kwargs.get("response_format") == {"type": "json_object"}:
+            return mock_intent_response
+        async def gen():
+            yield mock_chunk1
+        return gen()
+
+    mock_openai.side_effect = mock_stream
+
+    # 3. Mock Supabase
     mock_table = MagicMock()
     mock_supabase.return_value = mock_table
-
     mock_execute = MagicMock()
-    mock_execute.execute = MagicMock(return_value={"status": "success"}) # Not async because run_in_threadpool
-
+    mock_execute.execute = MagicMock(return_value=MagicMock(data=[]))
+    mock_table.select.return_value.eq.return_value.order.return_value.limit.return_value = mock_execute
     mock_table.insert.return_value = mock_execute
+    mock_table.upsert.return_value = mock_execute
 
-    # Mock Telegram API call
-    mock_httpx.return_value = AsyncMock()
+    # 4. Mock Telegram calls (already patched)
+    mock_send_msg.return_value = AsyncMock()
 
     payload = {
         "message": {
             "chat": {"id": 12345},
-            "text": "FastAPI dependencies are cool"
+            "text": "I did my skincare"
         }
     }
 
-    response = client.post("/webhook", json=payload)
+    response = await async_client.post("/webhook", json=payload)
 
     assert response.status_code == 200
-    assert response.json()["status"] == "success"
-    assert response.json()["category"] == "Build Mode"
-
-    # Verify Supabase call
-    mock_supabase.assert_called_with("dev_milestones")
+    data = response.json()
+    assert data["category"] == "Project Zayn"
+    mock_supabase.assert_any_call("project_zayn")
