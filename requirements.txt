@@ -6,4 +6,5 @@ httpx
 pydantic
 pytest
 pytest-asyncio
-google-generativeai
+anyio
+groq
