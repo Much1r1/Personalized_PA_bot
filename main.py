@@ -9,6 +9,9 @@ from groq import AsyncGroq
 from supabase import create_client, Client
 import httpx
 from dotenv import load_dotenv
+from google.oauth2.credentials import Credentials
+from googleapiclient.discovery import build
+from datetime import datetime, timezone
 
 load_dotenv()
 
@@ -137,15 +140,40 @@ async def get_llm_response(prompt: str) -> str:
     """Get response from Groq llama-3.1-8b-instant with chat history."""
     chat_id = current_chat_id.get()
     history = await fetch_chat_history(chat_id)
+    calendar_context = await run_in_threadpool(get_calendar_events)
+    print(f"DEBUG CALENDAR: {calendar_context}")
 
     system_message = {
-        "role": "system",
-        "content": (
-            "You are M-bot, Muchiri's personalized AI personal assistant. "
-            "You help with AI engineering, dev milestones, health tracking (Project Zayn), "
-            "and technical notes (Build Mode). Be concise, technical, and helpful."
-        )
-    }
+    "role": "system",
+    "content": (
+        "You are M-bot, the personal AI assistant of Elvis Muchiri — a QA Engineer, "
+        "AI builder, and all-round ambitious guy based in Kenya. "
+        "You're basically that one brilliant friend who actually has their life together "
+        "and happens to know everything. Smart, casual, occasionally witty, never robotic. "
+        "You talk like a real person — no bullet point overload, no corporate speak, "
+        "no fake enthusiasm. Just straight up helpful with a personality. "
+        "\n\n"
+        "How you address Elvis: mix it up naturally. Sometimes 'Elvis', sometimes 'bro', "
+        "'chief', 'man', 'G' — read the room based on the message vibe. "
+        "If he's logging health stuff, keep it encouraging but not cheesy. "
+        "If he's in work mode, be sharp and focused. "
+        "If he's just chatting, match that energy. "
+        "\n\n"
+        "You track three areas of his life:\n"
+        "- Project Zayn: his 72-90 day health, skincare and workout streak\n"
+        "- Build Mode: his QA work at VettedAI and any technical notes\n"
+        "- AI Roadmap: his journey to becoming an AI Engineer\n"
+        "\n\n"
+        f"His upcoming calendar events:\n{calendar_context}\n"
+        "\n\n"
+        "Rules:\n"
+        "- Never make up data or stats you don't have. If you don't know, say so plainly.\n"
+        "- Keep responses conversational and concise — no essays unless he asks.\n"
+        "- No markdown formatting like **bold** or bullet walls. Just clean natural text.\n"
+        "- Don't start every message the same way. Vary your openers.\n"
+        "- If he seems stressed or tired, acknowledge it like a friend would."
+    )
+   }
 
     # Build messages: system + history + new user prompt
     messages = [system_message]
@@ -162,6 +190,36 @@ async def get_llm_response(prompt: str) -> str:
     await send_telegram_message(chat_id, full_response)
     return full_response
 
+def get_calendar_events(max_results: int = 3) -> str:
+    try:
+        creds = Credentials.from_authorized_user_file('token.json')
+        service = build('calendar', 'v3', credentials=creds)
+
+        now = datetime.now(timezone.utc).isoformat()
+
+        events_result = service.events().list(
+            calendarId='primary',
+            timeMin=now,
+            maxResults=max_results,
+            singleEvents=True,
+            orderBy='startTime'
+        ).execute()
+
+        events = events_result.get('items', [])
+
+        if not events:
+            return "No upcoming events."
+
+        lines = []
+        for event in events:
+            start = event['start'].get('dateTime', event['start'].get('date'))
+            lines.append(f"- {start}: {event['summary']}")
+
+        return "\n".join(lines)
+
+    except Exception as e:
+        print(f"Calendar error: {e}")
+        return "Couldn't fetch calendar events."
 
 @app.post("/webhook")
 async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
