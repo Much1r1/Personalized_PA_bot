@@ -1,4 +1,5 @@
 import os
+import base64
 import json
 from typing import Optional, List, Dict, Any
 from contextvars import ContextVar
@@ -192,7 +193,31 @@ async def get_llm_response(prompt: str) -> str:
 
 def get_calendar_events(max_results: int = 3) -> str:
     try:
-        creds = Credentials.from_authorized_user_file('token.json')
+        # Load credentials from environment variables
+        token_b64 = os.getenv("GOOGLE_TOKEN")
+        
+        if not token_b64:
+            return "Calendar not configured."
+        
+        token_json = base64.b64decode(token_b64).decode()
+        token_data = json.loads(token_json)
+        
+        # Load client secrets for refresh
+        creds_b64 = os.getenv("GOOGLE_CREDENTIALS")
+        creds_json = base64.b64decode(creds_b64).decode()
+        creds_data = json.loads(creds_json)
+        
+        client_config = creds_data.get("installed") or creds_data.get("web")
+        
+        creds = Credentials(
+            token=token_data.get("token"),
+            refresh_token=token_data.get("refresh_token"),
+            token_uri=token_data.get("token_uri"),
+            client_id=client_config.get("client_id"),
+            client_secret=client_config.get("client_secret"),
+            scopes=token_data.get("scopes")
+        )
+
         service = build('calendar', 'v3', credentials=creds)
 
         now = datetime.now(timezone.utc).isoformat()
