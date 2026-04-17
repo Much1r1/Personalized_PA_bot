@@ -1,5 +1,7 @@
 import os
 import asyncio
+import base64
+import json
 from fastapi import FastAPI, Request
 from fastapi.concurrency import run_in_threadpool
 import time
@@ -82,10 +84,66 @@ async def sync_google_calendar():
                 duration = time.perf_counter() - start_time
                 print(f"Supabase telemetry: Connection successful. Duration: {duration:.4f}s")
 
-                # 1. Fetch user credentials from Supabase (Placeholder)
-                # 2. Initialize Google Calendar service
-                # 3. Fetch events
-                # 4. Upsert into 'user_schedules'
+                # 1. Fetch user credentials from environment variables
+                google_token_b64 = os.getenv("GOOGLE_TOKEN")
+                google_creds_b64 = os.getenv("GOOGLE_CREDENTIALS")
+
+                if google_token_b64 and google_creds_b64:
+                    token_data = json.loads(base64.b64decode(google_token_b64).decode())
+                    creds_data = json.loads(base64.b64decode(google_creds_b64).decode())
+
+                    credentials = Credentials(
+                        token=token_data.get("token"),
+                        refresh_token=token_data.get("refresh_token"),
+                        token_uri=token_data.get("token_uri"),
+                        client_id=creds_data.get("web", {}).get("client_id"),
+                        client_secret=creds_data.get("web", {}).get("client_secret"),
+                        scopes=token_data.get("scopes")
+                    )
+
+                    # 2. Initialize Google Calendar service
+                    service = await run_in_threadpool(lambda: build('calendar', 'v3', credentials=credentials))
+
+                    # 3. Fetch events
+                    now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+                    events_result = await run_in_threadpool(
+                        lambda: service.events().list(
+                            calendarId='primary',
+                            timeMin=now,
+                            maxResults=10,
+                            singleEvents=True,
+                            orderBy='startTime'
+                        ).execute()
+                    )
+                    events = events_result.get('items', [])
+
+                    # 4. Upsert into 'user_schedules'
+                    for event in events:
+                        start = event['start'].get('dateTime', event['start'].get('date'))
+                        # Ensure ISO format for Supabase
+                        if 'T' not in start:
+                            start = f"{start}T00:00:00Z"
+
+                        end = event['end'].get('dateTime', event['end'].get('date'))
+                        if 'T' not in end:
+                            end = f"{end}T23:59:59Z"
+
+                        payload = {
+                            "event_id": event['id'],
+                            "summary": event.get('summary', 'No Title'),
+                            "description": event.get('description'),
+                            "start_time": start,
+                            "end_time": end,
+                            "updated_at": datetime.now(timezone.utc).isoformat()
+                        }
+
+                        await run_in_threadpool(
+                            lambda: supabase.table("user_schedules").upsert(payload).execute()
+                        )
+
+                    print(f"Synced {len(events)} events.")
+                else:
+                    print("Google credentials/token not found in environment. Returning 'no-data' state internally.")
 
             except Exception as db_err:
                 duration = time.perf_counter() - start_time
