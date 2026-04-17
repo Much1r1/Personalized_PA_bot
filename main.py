@@ -9,10 +9,11 @@ from pydantic import BaseModel
 from groq import AsyncGroq
 from supabase import create_client, Client
 import httpx
+import asyncio
 from dotenv import load_dotenv
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 load_dotenv()
 
@@ -30,6 +31,150 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 # Context variable to store chat_id
 current_chat_id: ContextVar[int] = ContextVar("current_chat_id")
 
+async def nudge_engine():
+    """
+    Background task that queries user_tasks and user_alarms every minute.
+    Handles proactive messaging and the Escalation Policy.
+    """
+    while True:
+        try:
+            now = datetime.now(timezone.utc)
+
+            # 1. Handle Alarms
+            alarms_resp = await run_in_threadpool(
+                lambda: supabase.table("user_alarms")
+                .select("*")
+                .eq("status", "pending")
+                .lte("alarm_time", now.isoformat())
+                .execute()
+            )
+            for alarm in alarms_resp.data:
+                chat_id = alarm["chat_id"]
+                await send_telegram_message(chat_id, f"🚨 ALARM: {alarm['message']}")
+                await run_in_threadpool(
+                    lambda: supabase.table("user_alarms")
+                    .update({"status": "triggered", "triggered_at": now.isoformat()})
+                    .eq("id", alarm["id"])
+                    .execute()
+                )
+
+            # 2. Handle Escalation Policy (5-minute rule)
+            # Check for triggered alarms/tasks not acknowledged within 5 mins
+            escalation_time = now - timedelta(minutes=5)
+
+            # Alarms escalation
+            escalation_resp = await run_in_threadpool(
+                lambda: supabase.table("user_alarms")
+                .select("*")
+                .eq("status", "triggered")
+                .lte("triggered_at", escalation_time.isoformat())
+                .is_("acknowledged_at", "null")
+                .execute()
+            )
+            for alarm in escalation_resp.data:
+                chat_id = alarm["chat_id"]
+                await send_telegram_message(
+                    chat_id,
+                    f"⚠️ ESCALATION: You haven't acknowledged your alarm: {alarm['message']}. "
+                    "Your 'Probability of Outage' is increasing. Action required."
+                )
+                # To prevent spamming, we could update a 'last_escalated_at' or change status
+                await run_in_threadpool(
+                    lambda: supabase.table("user_alarms")
+                    .update({"triggered_at": now.isoformat()}) # Reset trigger time for next escalation check
+                    .eq("id", alarm["id"])
+                    .execute()
+                )
+
+            # 3. Handle Tasks due for nudge
+            tasks_resp = await run_in_threadpool(
+                lambda: supabase.table("user_tasks")
+                .select("*")
+                .eq("status", "pending")
+                .lte("due_date", now.isoformat())
+                .is_("triggered_at", "null")
+                .execute()
+            )
+            for task in tasks_resp.data:
+                chat_id = task["chat_id"]
+                await send_telegram_message(chat_id, f"🕒 TASK DUE: {task['title']}")
+                await run_in_threadpool(
+                    lambda: supabase.table("user_tasks")
+                    .update({"triggered_at": now.isoformat()})
+                    .eq("id", task["id"])
+                    .execute()
+                )
+
+            # Tasks escalation
+            task_escalation_resp = await run_in_threadpool(
+                lambda: supabase.table("user_tasks")
+                .select("*")
+                .eq("status", "pending")
+                .lte("triggered_at", escalation_time.isoformat())
+                .is_("acknowledged_at", "null")
+                .execute()
+            )
+            for task in task_escalation_resp.data:
+                chat_id = task["chat_id"]
+                await send_telegram_message(
+                    chat_id,
+                    f"⚠️ ESCALATION: Task '{task['title']}' is still pending! "
+                    "This is impacting your 'Probability of Outage'. Bro, get it done."
+                )
+                await run_in_threadpool(
+                    lambda: supabase.table("user_tasks")
+                    .update({"triggered_at": now.isoformat()})
+                    .eq("id", task["id"])
+                    .execute()
+                )
+
+            # 4. System Status Report (8:00 AM)
+            # This is a simplified check. In production, use a more robust scheduler.
+            if now.hour == 8 and now.minute == 0:
+                # For simplicity, we assume Elvis's chat_id is known or we fetch from a users table
+                # Here we fetch unique chat_ids from messages table as a proxy
+                active_chats = await run_in_threadpool(
+                    lambda: supabase.table("messages")
+                    .select("chat_id")
+                    .execute()
+                )
+                chat_ids = list(set([c["chat_id"] for c in active_chats.data]))
+
+                for chat_id in chat_ids:
+                    # 1. Fetch Today's Schedule
+                    schedule_str = await run_in_threadpool(get_calendar_events)
+
+                    # 2. Fetch High-Priority Tasks
+                    tasks_resp = await run_in_threadpool(
+                        lambda: supabase.table("user_tasks")
+                        .select("*")
+                        .eq("chat_id", chat_id)
+                        .eq("status", "pending")
+                        .order("impact_score", desc=True)
+                        .limit(5)
+                        .execute()
+                    )
+                    task_lines = [f"- {t['title']} (Impact: {t['impact_score']})" for t in tasks_resp.data]
+                    tasks_str = "\n".join(task_lines) if task_lines else "No pending tasks."
+
+                    report = (
+                        "📋 SYSTEM STATUS REPORT (8:00 AM)\n\n"
+                        "🗓 TODAY'S SCHEDULE:\n"
+                        f"{schedule_str}\n\n"
+                        "🚀 HIGH-PRIORITY FOCUS:\n"
+                        f"{tasks_str}\n\n"
+                        "Don't let the technical debt pile up. Let's get it today!"
+                    )
+                    await send_telegram_message(chat_id, report)
+
+        except Exception as e:
+            print(f"Nudge Engine Error: {e}")
+
+        await asyncio.sleep(60)
+
+@app.on_event("startup")
+async def startup_event():
+    asyncio.create_task(nudge_engine())
 
 async def classify_intent(text: str) -> Dict[str, Any]:
     """
@@ -38,17 +183,26 @@ async def classify_intent(text: str) -> Dict[str, Any]:
     """
     system_prompt = """
     You are an intent classifier for M-bot, a personal AI PA.
-    Classify the user's message into one of these three categories:
+    Classify the user's message into one of these five categories:
     1. 'Project Zayn': Health, skincare, or workout logs.
     2. 'Build Mode': Vetted-QA tasks or technical code notes.
     3. 'AI Roadmap': Tracking progress on AI Engineering milestones.
+    4. 'Task': User wants to add a new task or alarm.
+    5. 'Acknowledge': User is acknowledging an alert, alarm or task (e.g., 'done', 'ack', 'got it').
 
     For 'Project Zayn', also detect if they mentioned completing skincare or workout.
+    For 'Task', extract the 'title', 'due_date' (if any, in ISO format), and 'task_type' (task or alarm).
+    Also for 'Task', extract 'effort_score' (1-10) and 'impact_score' (1-10) if mentioned.
     Return ONLY a raw JSON object with no markdown or backticks:
     {
-        "category": "Project Zayn" | "Build Mode" | "AI Roadmap",
+        "category": "Project Zayn" | "Build Mode" | "AI Roadmap" | "Task" | "Acknowledge",
         "skincare_done": boolean (only for Project Zayn),
         "workout_done": boolean (only for Project Zayn),
+        "title": "string" (only for Task),
+        "due_date": "ISO string" (only for Task),
+        "task_type": "task" | "alarm" (only for Task),
+        "effort_score": integer (only for Task),
+        "impact_score": integer (only for Task),
         "content": "The original or cleaned up message content"
     }
     """
@@ -172,7 +326,9 @@ async def get_llm_response(prompt: str) -> str:
         "- Keep responses conversational and concise — no essays unless he asks.\n"
         "- No markdown formatting like **bold** or bullet walls. Just clean natural text.\n"
         "- Don't start every message the same way. Vary your openers.\n"
-        "- If he seems stressed or tired, acknowledge it like a friend would."
+        "- If he seems stressed or tired, acknowledge it like a friend would.\n"
+        "- If he just added a task without providing an effort/impact score, ask him for it: 'What is the effort/impact score?'\n"
+        "- If he provides scores, acknowledge it and suggest a focus order based on impact/effort."
     )
    }
 
@@ -192,59 +348,29 @@ async def get_llm_response(prompt: str) -> str:
     return full_response
 
 def get_calendar_events(max_results: int = 3) -> str:
+    """Queries Supabase user_schedules instead of direct Google API calls."""
     try:
-        # Load credentials from environment variables
-        token_b64 = os.getenv("GOOGLE_TOKEN")
-        
-        if not token_b64:
-            return "Calendar not configured."
-        
-        token_json = base64.b64decode(token_b64).decode()
-        token_data = json.loads(token_json)
-        
-        # Load client secrets for refresh
-        creds_b64 = os.getenv("GOOGLE_CREDENTIALS")
-        creds_json = base64.b64decode(creds_b64).decode()
-        creds_data = json.loads(creds_json)
-        
-        client_config = creds_data.get("installed") or creds_data.get("web")
-        
-        creds = Credentials(
-            token=token_data.get("token"),
-            refresh_token=token_data.get("refresh_token"),
-            token_uri=token_data.get("token_uri"),
-            client_id=client_config.get("client_id"),
-            client_secret=client_config.get("client_secret"),
-            scopes=token_data.get("scopes")
-        )
-
-        service = build('calendar', 'v3', credentials=creds)
-
         now = datetime.now(timezone.utc).isoformat()
+        response = supabase.table("user_schedules") \
+            .select("summary, start_time") \
+            .gte("start_time", now) \
+            .order("start_time") \
+            .limit(max_results) \
+            .execute()
 
-        events_result = service.events().list(
-            calendarId='primary',
-            timeMin=now,
-            maxResults=max_results,
-            singleEvents=True,
-            orderBy='startTime'
-        ).execute()
-
-        events = events_result.get('items', [])
-
+        events = response.data
         if not events:
             return "No upcoming events."
 
         lines = []
         for event in events:
-            start = event['start'].get('dateTime', event['start'].get('date'))
-            lines.append(f"- {start}: {event['summary']}")
+            lines.append(f"- {event['start_time']}: {event['summary']}")
 
         return "\n".join(lines)
 
     except Exception as e:
-        print(f"Calendar error: {e}")
-        return "Couldn't fetch calendar events."
+        print(f"Supabase calendar query error: {e}")
+        return "Couldn't fetch schedule from Supabase."
 
 @app.post("/webhook")
 async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
@@ -269,6 +395,10 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
             await store_project_zayn(classification)
         elif category in ["Build Mode", "AI Roadmap"]:
             await store_dev_milestone(category, classification)
+        elif category == "Task":
+            await store_task_or_alarm(chat_id, classification)
+        elif category == "Acknowledge":
+            await acknowledge_most_recent(chat_id)
 
         # 3. Generate LLM response
         full_response = await get_llm_response(text)
@@ -283,6 +413,60 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
         print(f"Error processing webhook: {e}")
         return {"status": "error", "message": str(e)}
 
+
+async def acknowledge_most_recent(chat_id: int):
+    """Mark the most recently triggered alarm or task as acknowledged."""
+    try:
+        now = datetime.now(timezone.utc).isoformat()
+        # Mark pending alarms that were triggered as acknowledged
+        await run_in_threadpool(
+            lambda: supabase.table("user_alarms")
+            .update({"status": "acknowledged", "acknowledged_at": now})
+            .eq("chat_id", chat_id)
+            .eq("status", "triggered")
+            .execute()
+        )
+        # Mark tasks as completed if they were triggered
+        await run_in_threadpool(
+            lambda: supabase.table("user_tasks")
+            .update({"status": "completed", "acknowledged_at": now})
+            .eq("chat_id", chat_id)
+            .neq("triggered_at", None)
+            .execute()
+        )
+    except Exception as e:
+        print(f"Error acknowledging: {e}")
+
+async def store_task_or_alarm(chat_id: int, data: Dict[str, Any]):
+    """Insert into 'user_tasks' or 'user_alarms' table."""
+    try:
+        task_type = data.get("task_type", "task")
+        if task_type == "alarm":
+            payload = {
+                "chat_id": chat_id,
+                "alarm_time": data.get("due_date", datetime.now(timezone.utc).isoformat()),
+                "message": data.get("title") or data.get("content")
+            }
+            await run_in_threadpool(
+                supabase.table("user_alarms").insert(payload).execute
+            )
+        else:
+            # Handle missing scores by prompting or default
+            effort = data.get("effort_score")
+            impact = data.get("impact_score")
+
+            payload = {
+                "chat_id": chat_id,
+                "title": data.get("title") or data.get("content"),
+                "due_date": data.get("due_date"),
+                "effort_score": effort,
+                "impact_score": impact
+            }
+            await run_in_threadpool(
+                supabase.table("user_tasks").insert(payload).execute
+            )
+    except Exception as e:
+        print(f"Error storing task/alarm: {e}")
 
 @app.get("/")
 async def root():
