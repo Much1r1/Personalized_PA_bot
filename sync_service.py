@@ -1,7 +1,9 @@
 import os
 import asyncio
 from fastapi import FastAPI, Request
-from supabase import create_client, Client
+from fastapi.concurrency import run_in_threadpool
+import time
+from supabase import create_client, Client, ClientOptions
 from dotenv import load_dotenv
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import Flow
@@ -25,7 +27,11 @@ GOOGLE_CLIENT_CONFIG = {
     }
 }
 
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+supabase: Client = create_client(
+    SUPABASE_URL,
+    SUPABASE_KEY,
+    options=ClientOptions(postgrest_client_timeout=5, storage_client_timeout=5)
+)
 app = FastAPI(title="M-bot Sync Service")
 
 @app.get("/auth/google")
@@ -67,28 +73,53 @@ async def sync_google_calendar():
         try:
             print(f"[{datetime.now()}] Starting Google Calendar Sync...")
 
-            # 1. Fetch user credentials from Supabase (Placeholder)
-            # 2. Initialize Google Calendar service
-            # 3. Fetch events
-            # 4. Upsert into 'user_schedules'
+            start_time = time.perf_counter()
+            try:
+                # Telemetry: Log connection duration for Supabase query
+                await run_in_threadpool(
+                    lambda: supabase.table("user_schedules").select("id").limit(1).execute()
+                )
+                duration = time.perf_counter() - start_time
+                print(f"Supabase telemetry: Connection successful. Duration: {duration:.4f}s")
 
-            # Example Upsert:
-            # payload = {
-            #     "event_id": event['id'],
-            #     "summary": event['summary'],
-            #     "start_time": event['start'].get('dateTime'),
-            #     "end_time": event['end'].get('dateTime')
-            # }
-            # supabase.table("user_schedules").upsert(payload).execute()
+                # 1. Fetch user credentials from Supabase (Placeholder)
+                # 2. Initialize Google Calendar service
+                # 3. Fetch events
+                # 4. Upsert into 'user_schedules'
+
+            except Exception as db_err:
+                duration = time.perf_counter() - start_time
+                error_type = type(db_err).__name__
+                print(f"Supabase telemetry: Failure after {duration:.4f}s. Error: {error_type}")
+
+                # Specifically log TimeoutError or ConnectionError
+                err_msg = str(db_err).lower()
+                if "timeout" in err_msg or "connection" in err_msg:
+                    print(f"CRITICAL ERROR: Supabase {error_type} - {db_err}")
+
+                # Re-raise to be caught by the outer loop for retry
+                raise db_err
 
             await asyncio.sleep(600)  # Sync every 10 minutes
         except Exception as e:
-            print(f"Sync error: {e}")
+            print(f"Sync loop error: {e}")
             await asyncio.sleep(60)
 
 @app.on_event("startup")
 async def startup_event():
     asyncio.create_task(sync_google_calendar())
+
+@app.get("/health")
+async def health_check():
+    """Verifies connection to Supabase and returns status."""
+    try:
+        # Simple query to check connectivity
+        await run_in_threadpool(
+            lambda: supabase.table("user_schedules").select("id").limit(1).execute()
+        )
+        return {"status": "SUCCESS", "message": "Connection to Supabase is active."}
+    except Exception as e:
+        return {"status": "FAILURE", "error": str(e)}
 
 @app.get("/")
 async def root():
