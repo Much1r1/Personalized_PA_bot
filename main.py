@@ -455,7 +455,7 @@ def get_calendar_events(max_results: int = 3) -> str:
         calendar_id = "primary"
        
         now = datetime.now(timezone.utc).isoformat() + "Z" # 'Z' indicates UTC time
-        events_result = service.events().list(calendarId=calendar_id='primary', timeMin=now, maxResults=max_results, singleEvents=True, orderBy="startTime").execute()
+        events_result = service.events().list(calendarId='primary', timeMin=now, maxResults=max_results, singleEvents=True, orderBy="startTime").execute()
 
         events = events_result.get("items", [])
         if not events:
