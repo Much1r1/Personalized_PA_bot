@@ -190,13 +190,40 @@ class FunctionDispatcher:
                 return await run_in_threadpool(lambda: self.tools[func_name](**args))
         raise ValueError(f"Unknown tool: {func_name}")
 
-def get_schedule(max_results: int = 5) -> str:
-    """
-    Retrieves the ueser's upcoming calendar events and schedule.
-    Args:
-      max_results: The number of upcoming events to fetch.
-    """
-    return get_calendar_events(max_results)
+SCOPES = ['https://www.googleapis.com/auth/calendar.readonly']
+
+def get_calendar_events(max_results: int = 5) -> str:
+    """Queries Google Calendar API directly."""
+    try:
+        creds = get_google_creds()
+        service = build('calendar', 'v3', credentials=creds)
+
+        # Call the Calendar API
+        now = datetime.now(timezone.utc).isoformat()
+        events_result = service.events().list(
+            calendarId='primary', 
+            timeMin=now,
+            maxResults=max_results, 
+            singleEvents=True,
+            orderBy='startTime'
+        ).execute()
+        
+        events = events_result.get('items', [])
+
+        if not events:
+            return "No upcoming events found."
+
+        event_list = []
+        for event in events:
+            start = event['start'].get('dateTime', event['start'].get('date'))
+            # Basic formatting to keep it clean for the LLM
+            event_list.append(f"- {start}: {event.get('summary')}")
+            
+        return "\n".join(event_list)
+
+    except Exception as e:
+        print(f"Calendar API Error: {e}")
+        return "Couldn't fetch your schedule right now, bro."
 
 dispatcher = FunctionDispatcher()
 dispatcher.register("get_schedule", get_schedule)
