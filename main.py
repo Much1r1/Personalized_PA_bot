@@ -190,9 +190,11 @@ class FunctionDispatcher:
                 return await run_in_threadpool(lambda: self.tools[func_name](**args))
         raise ValueError(f"Unknown tool: {func_name}")
 
-def get_schedule(max_results: int = 3) -> str:
+def get_schedule(max_results: int = 5) -> str:
     """
-    Get the upcoming calendar events from the user's schedule.
+    Retrieves the ueser's upcoming calendar events and schedule.
+    Args:
+      max_results: The number of upcoming events to fetch.
     """
     return get_calendar_events(max_results)
 
@@ -374,15 +376,18 @@ async def get_llm_response(prompt: str) -> str:
 
             while response.candidates[0].content.parts[0].function_call:
                 tool_call = response.candidates[0].content.parts[0].function_call
+                # Dispatch the call
                 result = await dispatcher.dispatch(tool_call)
                 # Google Generative AI Part structure for function response
                 response = await chat.send_message_async(
-                    {
-                        "function_response": {
-                            "name": tool_call.name,
-                            "response": {"result": result}
-                        }
-                    }
+                    genai.types.Content(
+                        parts=[
+                            genai.types.Part.from_function_response(
+                                name=tool_call.name,
+                                response={"result": result}
+                            )
+                        ]
+                    )
                 )
 
             return response.text
