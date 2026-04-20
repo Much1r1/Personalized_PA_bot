@@ -225,7 +225,7 @@ def get_calendar_events(max_results: int = 5) -> str:
         print(f"Calendar API Error: {e}")
         return "Couldn't fetch your schedule right now, bro."
 
-def get_schedule=(max_results: int = 5) -> str:
+def get_schedule(max_results: int = 5) -> str:
     """Retrieves the user's upcoming calendar events."""
     return get_calendar_events(max_results)
 
