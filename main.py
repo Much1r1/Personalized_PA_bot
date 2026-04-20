@@ -448,28 +448,28 @@ async def get_groq_response(prompt: str, history: List[Dict[str, str]]) -> str:
     return response.choices[0].message.content
 
 def get_calendar_events(max_results: int = 3) -> str:
-    """Queries Supabase user_schedules instead of direct Google API calls."""
+    """Queries Google Calendar API directly.."""
     try:
-        now = datetime.now(timezone.utc).isoformat()
-        response = supabase.table("user_schedules") \
-            .select("summary, start_time") \
-            .gte("start_time", now) \
-            .order("start_time") \
-            .limit(max_results) \
-            .execute()
+        creds = Credentials.from_authorized_user_file("credentials.json", ["https://www.googleapis.com/auth/calendar.readonly"])
+        service = build("calendar", "v3", credentials=creds)
+        calendar_id = "primary"
+       
+        now = datetime.now(timezone.utc).isoformat() + "Z" # 'Z' indicates UTC time
+        events_result = service.events().list(calendarId=calendar_id='primary', timeMin=now, maxResults=max_results, singleEvents=True, orderBy="startTime").execute()
 
-        events = response.data
+        events = events_result.get("items", [])
         if not events:
             return "No upcoming events."
 
         lines = []
         for event in events:
+            start = event["start"].get("dateTime", event["start"].get("date"))
             lines.append(f"- {event['start_time']}: {event['summary']}")
 
         return "\n".join(lines)
     except Exception as e:
-        print(f"Supabase calendar query error: {e}")
-        return "Couldn't fetch schedule from Supabase."
+        print(f"Google Calendar API error: {e}")
+        return "Couldn't fetch schedule from Google Calendar."
 
 @app.post("/webhook")
 async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
