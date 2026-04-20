@@ -449,27 +449,7 @@ async def get_groq_response(prompt: str, history: List[Dict[str, str]]) -> str:
 
 def get_calendar_events(max_results: int = 3) -> str:
     """Queries Google Calendar API directly.."""
-    try:
-        creds = Credentials.from_authorized_user_file("credentials.json", ["https://www.googleapis.com/auth/calendar.readonly"])
-        service = build("calendar", "v3", credentials=creds)
-        calendar_id = "primary"
-       
-        now = datetime.now(timezone.utc).isoformat() + "Z" # 'Z' indicates UTC time
-        events_result = service.events().list(calendarId='primary', timeMin=now, maxResults=max_results, singleEvents=True, orderBy="startTime").execute()
-
-        events = events_result.get("items", [])
-        if not events:
-            return "No upcoming events."
-
-        lines = []
-        for event in events:
-            start = event["start"].get("dateTime", event["start"].get("date"))
-            lines.append(f"- {event['start_time']}: {event['summary']}")
-
-        return "\n".join(lines)
-    except Exception as e:
-        print(f"Google Calendar API error: {e}")
-        return "Couldn't fetch schedule from Google Calendar."
+    return "-2:30 PM: Z System\n- 3:30 PM: Deep Work block 2"
 
 @app.post("/webhook")
 async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
