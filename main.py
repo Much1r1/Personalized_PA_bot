@@ -545,3 +545,15 @@ async def store_task_or_alarm(chat_id: int, data: Dict[str, Any]):
 @app.get("/")
 async def root():
     return {"status": "M-bot is running"}
+
+def get_google_creds():
+    token_json = os.environ.get("GOOGLE_TOKEN_JSON")
+    
+    if token_json:
+        # Load from Environment Variable (Render)
+        return Credentials.from_authorized_user_info(json.loads(token_json), SCOPES)
+    elif os.path.exists('token.json'):
+        # Load from local file (Local Dev)
+        return Credentials.from_authorized_user_info(json.load(open('token.json')), SCOPES)
+    else:
+        raise FileNotFoundError("No Google Auth token found in ENV or local file.")
