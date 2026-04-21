@@ -15,7 +15,7 @@ from dotenv import load_dotenv
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from datetime import datetime, timezone, timedelta
-from google.auth.transport.requests import Request
+from google.auth.transport.requests import Request as GoogleRequest
 
 load_dotenv()
 
@@ -628,7 +628,7 @@ def get_google_creds():
         # 2. Check if refresh is needed
         if creds and creds.expired and creds.refresh_token:
             print("Token expired. Initiating self-healing refresh...")
-            creds.refresh(Request())
+            creds.refresh(GoogleRequest())
             
             # 3. Save the NEW token back to Supabase
             updated_token_json = json.loads(creds.to_json())
