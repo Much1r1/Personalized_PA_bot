@@ -479,7 +479,19 @@ async def get_groq_response(prompt: str, history: List[Dict[str, str]]) -> str:
         messages=messages
     )
 
-    return response.choices[0].message.contentssss
+    return response.choices[0].message.content
+
+def get_calendar_events(max_results: int = 10):
+    creds = get_google_creds()
+    if not creds:
+        return "Authentication failed. Check Supabase connection."
+    
+    try:
+        service = build('calendar', 'v3', credentials=creds)
+        # Add your list logic here
+        return "Successfully connected to Calendar."
+    except Exception as e:
+        return f"API Error: {str(e)}"
 
 @app.post("/webhook")
 async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
