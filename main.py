@@ -480,9 +480,41 @@ async def get_groq_response(prompt: str, history: List[Dict[str, str]]) -> str:
 
     return response.choices[0].message.content
 
-def get_calendar_events(max_results: int = 3) -> str:
-    """Queries Google Calendar API directly.."""
-    return "-2:30 PM: Z System\n- 3:30 PM: Deep Work block 2"
+def get_calendar_events(max_results: int = 5) -> str:
+    """Queries Google Calendar API with Nairobi Timezone awareness."""
+    try:
+        creds = get_google_creds()
+        service = build('calendar', 'v3', credentials=creds)
+
+        # Get current time in Nairobi (UTC+3)
+        nairobi_tz = timezone(timedelta(hours=3))
+        now = datetime.now(nairobi_tz).isoformat()
+
+        events_result = service.events().list(
+            calendarId='primary', 
+            timeMin=now,
+            maxResults=max_results, 
+            singleEvents=True,
+            orderBy='startTime'
+        ).execute()
+        
+        events = events_result.get('items', [])
+
+        if not events:
+            return "Your schedule is clear for the rest of the day, chief."
+
+        event_list = []
+        for event in events:
+            start = event['start'].get('dateTime', event['start'].get('date'))
+            # Format time correctly for EAT
+            display_time = start.split('T')[1][:5] if 'T' in start else "All Day"
+            event_list.append(f"- {display_time}: {event.get('summary')}")
+            
+        return "\n".join(event_list)
+
+    except Exception as e:
+        print(f"Calendar API Error: {e}")
+        return "Couldn't fetch the live schedule. Check the Google token, bro."
 
 @app.post("/webhook")
 async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
