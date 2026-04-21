@@ -217,9 +217,11 @@ def get_calendar_events(max_results: int = 5) -> str:
         for event in events:
             start = event['start'].get('dateTime', event['start'].get('date'))
             # Basic formatting to keep it clean for the LLM
-            event_list.append(f"- {start}: {event.get('summary')}")
+            display_time = start.split('T')[1][:5] if 'T' in start else "All Day"
+            event_list.append(f"- {display_time}: {event.get('summary')}")
             
-        return "- 2:30 PM: Z System\n- 3:30 PM: Deep Work block 2   "
+        return "\n".join(event_list)
+        
 
     except Exception as e:
         print(f"Calendar API Error: {e}")
