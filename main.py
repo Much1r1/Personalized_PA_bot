@@ -233,7 +233,7 @@ def get_schedule(max_results: int = 5) -> str:
     return get_calendar_events(max_results)
 
 dispatcher = FunctionDispatcher()
-dispatcher.register("get_schedule", get_schedule)
+dispatcher.register("get_calendar_events", get_calendar_events)
 
 nudge_engine_service = NudgeEngine(supabase)
 
@@ -397,7 +397,7 @@ async def get_llm_response(prompt: str) -> str:
             model = genai.GenerativeModel(
                 model_name="gemini-1.5-flash",
                 system_instruction=system_instruction,
-                tools=[get_schedule]
+                tools=[get_calendar_events]
             )
 
             gemini_history = []
