@@ -49,92 +49,102 @@ class NudgeEngine:
         while True:
             try:
                 now = datetime.now(timezone.utc)
-
-                # 1. Handle Alarms
-                alarms_resp = await run_in_threadpool(
-                    lambda: self.supabase.table("user_alarms")
-                    .select("*")
-                    .eq("status", "pending")
-                    .lte("alarm_time", now.isoformat())
-                    .execute()
-                )
-                for alarm in alarms_resp.data:
-                    chat_id = alarm["chat_id"]
-                    await send_telegram_message(chat_id, f"🚨 ALARM: {alarm['message']}")
-                    await run_in_threadpool(
-                        lambda: self.supabase.table("user_alarms")
-                        .update({"status": "triggered", "triggered_at": now.isoformat()})
-                        .eq("id", alarm["id"])
-                        .execute()
-                    )
-
-                # 2. Handle Escalation Policy (5-minute rule)
                 escalation_time = now - timedelta(minutes=5)
 
-                # Alarms escalation
-                escalation_resp = await run_in_threadpool(
-                    lambda: self.supabase.table("user_alarms")
-                    .select("*")
-                    .eq("status", "triggered")
-                    .lte("triggered_at", escalation_time.isoformat())
-                    .is_("acknowledged_at", "null")
-                    .execute()
-                )
-                for alarm in escalation_resp.data:
-                    chat_id = alarm["chat_id"]
-                    await send_telegram_message(
-                        chat_id,
-                        f"⚠️ ESCALATION: You haven't acknowledged your alarm: {alarm['message']}. "
-                        "Your 'Probability of Outage' is increasing. Action required."
-                    )
-                    await run_in_threadpool(
+                # 1. Handle Alarms
+                try:
+                    alarms_resp = await run_in_threadpool(
                         lambda: self.supabase.table("user_alarms")
-                        .update({"triggered_at": now.isoformat()})
-                        .eq("id", alarm["id"])
+                        .select("*")
+                        .eq("status", "pending")
+                        .lte("alarm_time", now.isoformat())
                         .execute()
                     )
+                    for alarm in alarms_resp.data:
+                        chat_id = alarm["chat_id"]
+                        await send_telegram_message(chat_id, f"🚨 ALARM: {alarm['message']}")
+                        await run_in_threadpool(
+                            lambda: self.supabase.table("user_alarms")
+                            .update({"status": "triggered", "triggered_at": now.isoformat()})
+                            .eq("id", alarm["id"])
+                            .execute()
+                        )
+                except Exception as e:
+                    print(f"Nudge Engine Alarms Error: {e}")
+
+                # 2. Handle Escalation Policy (5-minute rule)
+                try:
+                    escalation_resp = await run_in_threadpool(
+                        lambda: self.supabase.table("user_alarms")
+                        .select("*")
+                        .eq("status", "triggered")
+                        .lte("triggered_at", escalation_time.isoformat())
+                        .is_("acknowledged_at", "null")
+                        .execute()
+                    )
+                    for alarm in escalation_resp.data:
+                        chat_id = alarm["chat_id"]
+                        await send_telegram_message(
+                            chat_id,
+                            f"⚠️ ESCALATION: You haven't acknowledged your alarm: {alarm['message']}. "
+                            "Your 'Probability of Outage' is increasing. Action required."
+                        )
+                        await run_in_threadpool(
+                            lambda: self.supabase.table("user_alarms")
+                            .update({"triggered_at": now.isoformat()})
+                            .eq("id", alarm["id"])
+                            .execute()
+                        )
+                except Exception as e:
+                    print(f"Nudge Engine Alarm Escalation Error: {e}")
 
                 # 3. Handle Tasks due for nudge
-                tasks_resp = await run_in_threadpool(
-                    lambda: self.supabase.table("user_tasks")
-                    .select("*")
-                    .eq("status", "pending")
-                    .lte("due_date", now.isoformat())
-                    .is_("triggered_at", "null")
-                    .execute()
-                )
-                for task in tasks_resp.data:
-                    chat_id = task["chat_id"]
-                    await send_telegram_message(chat_id, f"🕒 TASK DUE: {task['title']}")
-                    await run_in_threadpool(
+                try:
+                    tasks_resp = await run_in_threadpool(
                         lambda: self.supabase.table("user_tasks")
-                        .update({"triggered_at": now.isoformat()})
-                        .eq("id", task["id"])
+                        .select("*")
+                        .eq("status", "pending")
+                        .lte("due_date", now.isoformat())
+                        .is_("triggered_at", "null")
                         .execute()
                     )
+                    for task in tasks_resp.data:
+                        chat_id = task["chat_id"]
+                        await send_telegram_message(chat_id, f"🕒 TASK DUE: {task['title']}")
+                        await run_in_threadpool(
+                            lambda: self.supabase.table("user_tasks")
+                            .update({"triggered_at": now.isoformat()})
+                            .eq("id", task["id"])
+                            .execute()
+                        )
+                except Exception as e:
+                    print(f"Nudge Engine Tasks Error: {e}")
 
                 # Tasks escalation
-                task_escalation_resp = await run_in_threadpool(
-                    lambda: self.supabase.table("user_tasks")
-                    .select("*")
-                    .eq("status", "pending")
-                    .lte("triggered_at", escalation_time.isoformat())
-                    .is_("acknowledged_at", "null")
-                    .execute()
-                )
-                for task in task_escalation_resp.data:
-                    chat_id = task["chat_id"]
-                    await send_telegram_message(
-                        chat_id,
-                        f"⚠️ ESCALATION: Task '{task['title']}' is still pending! "
-                        "This is impacting your 'Probability of Outage'. Bro, get it done."
-                    )
-                    await run_in_threadpool(
+                try:
+                    task_escalation_resp = await run_in_threadpool(
                         lambda: self.supabase.table("user_tasks")
-                        .update({"triggered_at": now.isoformat()})
-                        .eq("id", task["id"])
+                        .select("*")
+                        .eq("status", "pending")
+                        .lte("triggered_at", escalation_time.isoformat())
+                        .is_("acknowledged_at", "null")
                         .execute()
                     )
+                    for task in task_escalation_resp.data:
+                        chat_id = task["chat_id"]
+                        await send_telegram_message(
+                            chat_id,
+                            f"⚠️ ESCALATION: Task '{task['title']}' is still pending! "
+                            "This is impacting your 'Probability of Outage'. Bro, get it done."
+                        )
+                        await run_in_threadpool(
+                            lambda: self.supabase.table("user_tasks")
+                            .update({"triggered_at": now.isoformat()})
+                            .eq("id", task["id"])
+                            .execute()
+                        )
+                except Exception as e:
+                    print(f"Nudge Engine Task Escalation Error: {e}")
 
                 # 4. System Status Report (8:00 AM)
                 if now.hour == 8 and now.minute == 0:
@@ -197,14 +207,17 @@ def get_calendar_events(max_results: int = 5) -> str:
     """Queries Google Calendar API directly."""
     try:
         creds = get_google_creds()
+        if not creds:
+            return "Authentication failed. Check your Google Calendar connection."
+
         service = build('calendar', 'v3', credentials=creds)
 
         # Call the Calendar API
-        now = datetime.now(timezone.utc).isoformat()
+        now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         events_result = service.events().list(
-            calendarId='primary', 
+            calendarId='primary',
             timeMin=now,
-            maxResults=max_results, 
+            maxResults=max_results,
             singleEvents=True,
             orderBy='startTime'
         ).execute()
@@ -481,17 +494,6 @@ async def get_groq_response(prompt: str, history: List[Dict[str, str]]) -> str:
 
     return response.choices[0].message.content
 
-def get_calendar_events(max_results: int = 10):
-    creds = get_google_creds()
-    if not creds:
-        return "Authentication failed. Check Supabase connection."
-    
-    try:
-        service = build('calendar', 'v3', credentials=creds)
-        # Add your list logic here
-        return "Successfully connected to Calendar."
-    except Exception as e:
-        return f"API Error: {str(e)}"
 
 @app.post("/webhook")
 async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
@@ -508,24 +510,32 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
         current_chat_id.set(chat_id)
 
         # 1. Classify Intent
-        classification = await classify_intent(text)
-        category = classification.get("category")
+        try:
+            classification = await classify_intent(text)
+            category = classification.get("category")
 
-        # 2. Specialized storage based on category
-        if category == "Project Zayn":
-            await store_project_zayn(classification)
-        elif category in ["Build Mode", "AI Roadmap"]:
-            await store_dev_milestone(category, classification)
-        elif category == "Task":
-            await store_task_or_alarm(chat_id, classification)
-        elif category == "Acknowledge":
-            await acknowledge_most_recent(chat_id)
+            # 2. Specialized storage based on category
+            if category == "Project Zayn":
+                background_tasks.add_task(store_project_zayn, classification)
+            elif category in ["Build Mode", "AI Roadmap"]:
+                background_tasks.add_task(store_dev_milestone, category, classification)
+            elif category == "Task":
+                background_tasks.add_task(store_task_or_alarm, chat_id, classification)
+            elif category == "Acknowledge":
+                background_tasks.add_task(acknowledge_most_recent, chat_id)
+        except Exception as e:
+            print(f"Classification or specialized storage error: {e}")
+            category = "Unknown"
 
         # 3. Generate LLM response
-        full_response = await get_llm_response(text)
-
-        # 4. Send response to Telegram
-        await send_telegram_message(chat_id, full_response)
+        try:
+            full_response = await get_llm_response(text)
+            # 4. Send response to Telegram
+            await send_telegram_message(chat_id, full_response)
+        except Exception as e:
+            print(f"LLM or Telegram error: {e}")
+            full_response = "Sorry bro, I'm having some trouble processing that right now."
+            await send_telegram_message(chat_id, full_response)
 
         # 5. Store messages in background
         background_tasks.add_task(store_message, chat_id, "user", text)
@@ -534,6 +544,7 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
         return {"status": "success", "category": category}
     except Exception as e:
         print(f"Error processing webhook: {e}")
+        # Always return 200 OK to Telegram
         return {"status": "error", "message": str(e)}
 
 async def acknowledge_most_recent(chat_id: int):
@@ -590,14 +601,43 @@ async def root():
 
 def get_google_creds():
     try:
-        # Check if URL/KEY actually exist
         if not SUPABASE_URL or not SUPABASE_KEY:
             print("❌ M-Bot Error: SUPABASE_URL or KEY is missing from Env Vars")
             return None
 
-        res = supabase.table("system_config").select("value").eq("key", "google_token").single().execute()
-        
-        # ... rest of your code
+        res = supabase.table("system_config").select("value").eq("key", "google_token").execute()
+        if not res.data:
+            print("❌ M-Bot Error: google_token not found in system_config")
+            return None
+
+        token_data = res.data[0]["value"]
+        if isinstance(token_data, str):
+            token_data = json.loads(token_data)
+
+        creds = Credentials(
+            token=token_data.get("token"),
+            refresh_token=token_data.get("refresh_token"),
+            token_uri=token_data.get("token_uri"),
+            client_id=token_data.get("client_id") or os.getenv("GOOGLE_CLIENT_ID"),
+            client_secret=token_data.get("client_secret") or os.getenv("GOOGLE_CLIENT_SECRET"),
+            scopes=token_data.get("scopes")
+        )
+
+        if creds and creds.expired and creds.refresh_token:
+            print("🔄 Refreshing Google OAuth token...")
+            creds.refresh(GoogleRequest())
+            # Update the token in Supabase
+            updated_token_data = {
+                "token": creds.token,
+                "refresh_token": creds.refresh_token,
+                "token_uri": creds.token_uri,
+                "client_id": creds.client_id,
+                "client_secret": creds.client_secret,
+                "scopes": creds.scopes
+            }
+            supabase.table("system_config").update({"value": updated_token_data}).eq("key", "google_token").execute()
+
+        return creds
     except Exception as e:
         print(f"⚠️ M-Bot Auth Crash Detail: {type(e).__name__} - {str(e)}")
         return None
