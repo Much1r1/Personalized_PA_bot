@@ -37,6 +37,125 @@ if GEMINI_API_KEY:
 # Context variable to store chat_id
 current_chat_id: ContextVar[int] = ContextVar("current_chat_id")
 
+
+def get_google_creds():
+    try:
+        if not SUPABASE_URL or not SUPABASE_KEY:
+            print("❌ M-Bot Error: SUPABASE_URL or KEY is missing from Env Vars")
+            return None
+
+        res = supabase.table("system_config").select("value").eq("key", "google_token").execute()
+        if not res.data:
+            print("❌ M-Bot Error: google_token not found in system_config")
+            return None
+
+        token_data = res.data[0]["value"]
+        if isinstance(token_data, str):
+            token_data = json.loads(token_data)
+
+        # Parse expiry so creds.expired works correctly
+        expiry_str = token_data.get("expiry")
+        expiry = datetime.fromisoformat(expiry_str) if expiry_str else None
+
+        creds = Credentials(
+            token=token_data.get("token"),
+            refresh_token=token_data.get("refresh_token"),
+            token_uri=token_data.get("token_uri"),
+            client_id=token_data.get("client_id") or os.getenv("GOOGLE_CLIENT_ID"),
+            client_secret=token_data.get("client_secret") or os.getenv("GOOGLE_CLIENT_SECRET"),
+            scopes=token_data.get("scopes"),
+            expiry=expiry  # ← critical: without this, creds.expired is always False
+        )
+
+        if creds and creds.expired and creds.refresh_token:
+            print("🔄 Refreshing Google OAuth token...")
+            creds.refresh(GoogleRequest())
+
+            # Persist the refreshed token back to Supabase
+            updated_token_data = {
+                "token": creds.token,
+                "refresh_token": creds.refresh_token,
+                "token_uri": creds.token_uri,
+                "client_id": creds.client_id,
+                "client_secret": creds.client_secret,
+                "scopes": list(creds.scopes),
+                "expiry": creds.expiry.isoformat() if creds.expiry else None  # ← persist expiry too
+            }
+            supabase.table("system_config").update({"value": updated_token_data}).eq("key", "google_token").execute()
+            print("✅ Google token refreshed and saved to Supabase.")
+
+        return creds
+    except Exception as e:
+        print(f"⚠️ M-Bot Auth Crash Detail: {type(e).__name__} - {str(e)}")
+        return None
+
+
+SCOPES = ['https://www.googleapis.com/auth/calendar.readonly']
+
+
+def get_calendar_events(max_results: int = 5) -> str:
+    """Queries Google Calendar API directly."""
+    try:
+        creds = get_google_creds()
+        if not creds:
+            return "Authentication failed. Check your Google Calendar connection."
+
+        service = build('calendar', 'v3', credentials=creds)
+
+        now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        events_result = service.events().list(
+            calendarId='primary',
+            timeMin=now,
+            maxResults=max_results,
+            singleEvents=True,
+            orderBy='startTime'
+        ).execute()
+
+        events = events_result.get('items', [])
+
+        if not events:
+            return "No upcoming events found."
+
+        event_list = []
+        for event in events:
+            start = event['start'].get('dateTime', event['start'].get('date'))
+            display_time = start.split('T')[1][:5] if 'T' in start else "All Day"
+            event_list.append(f"- {display_time}: {event.get('summary')}")
+
+        return "\n".join(event_list)
+
+    except Exception as e:
+        print(f"Calendar API Error: {e}")
+        return "Couldn't fetch your schedule right now, bro."
+
+
+def get_schedule(max_results: int = 5) -> str:
+    """Retrieves the user's upcoming calendar events."""
+    return get_calendar_events(max_results)
+
+
+class FunctionDispatcher:
+    def __init__(self):
+        self.tools: Dict[str, Callable] = {}
+
+    def register(self, name: str, func: Callable):
+        self.tools[name] = func
+
+    async def dispatch(self, tool_call) -> Any:
+        func_name = tool_call.name
+        args = tool_call.args
+        if func_name in self.tools:
+            if asyncio.iscoroutinefunction(self.tools[func_name]):
+                return await self.tools[func_name](**args)
+            else:
+                return await run_in_threadpool(lambda: self.tools[func_name](**args))
+        raise ValueError(f"Unknown tool: {func_name}")
+
+
+dispatcher = FunctionDispatcher()
+dispatcher.register("get_calendar_events", get_calendar_events)
+
+
 class NudgeEngine:
     def __init__(self, supabase_client: Client):
         self.supabase = supabase_client
@@ -184,75 +303,14 @@ class NudgeEngine:
 
             await asyncio.sleep(60)
 
-class FunctionDispatcher:
-    def __init__(self):
-        self.tools: Dict[str, Callable] = {}
-
-    def register(self, name: str, func: Callable):
-        self.tools[name] = func
-
-    async def dispatch(self, tool_call) -> Any:
-        func_name = tool_call.name
-        args = tool_call.args
-        if func_name in self.tools:
-            if asyncio.iscoroutinefunction(self.tools[func_name]):
-                return await self.tools[func_name](**args)
-            else:
-                return await run_in_threadpool(lambda: self.tools[func_name](**args))
-        raise ValueError(f"Unknown tool: {func_name}")
-
-SCOPES = ['https://www.googleapis.com/auth/calendar.readonly']
-
-def get_calendar_events(max_results: int = 5) -> str:
-    """Queries Google Calendar API directly."""
-    try:
-        creds = get_google_creds()
-        if not creds:
-            return "Authentication failed. Check your Google Calendar connection."
-
-        service = build('calendar', 'v3', credentials=creds)
-
-        # Call the Calendar API
-        now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-        events_result = service.events().list(
-            calendarId='primary',
-            timeMin=now,
-            maxResults=max_results,
-            singleEvents=True,
-            orderBy='startTime'
-        ).execute()
-        
-        events = events_result.get('items', [])
-
-        if not events:
-            return "No upcoming events found."
-
-        event_list = []
-        for event in events:
-            start = event['start'].get('dateTime', event['start'].get('date'))
-            # Basic formatting to keep it clean for the LLM
-            display_time = start.split('T')[1][:5] if 'T' in start else "All Day"
-            event_list.append(f"- {display_time}: {event.get('summary')}")
-            
-        return "\n".join(event_list)
-        
-
-    except Exception as e:
-        print(f"Calendar API Error: {e}")
-        return "Couldn't fetch your schedule right now, bro."
-
-def get_schedule(max_results: int = 5) -> str:
-    """Retrieves the user's upcoming calendar events."""
-    return get_calendar_events(max_results)
-
-dispatcher = FunctionDispatcher()
-dispatcher.register("get_calendar_events", get_calendar_events)
 
 nudge_engine_service = NudgeEngine(supabase)
+
 
 @app.on_event("startup")
 async def startup_event():
     asyncio.create_task(nudge_engine_service.run())
+
 
 async def classify_intent(text: str) -> Dict[str, Any]:
     """
@@ -370,7 +428,7 @@ async def send_telegram_message(chat_id: int, text: str):
 
 
 async def get_llm_response(prompt: str) -> str:
-    """Get response from Gemini with tool calling support."""
+    """Get response from Gemini with tool calling support, fallback to Groq."""
     chat_id = current_chat_id.get()
     history = await fetch_chat_history(chat_id)
 
@@ -423,9 +481,7 @@ async def get_llm_response(prompt: str) -> str:
 
             while response.candidates[0].content.parts[0].function_call:
                 tool_call = response.candidates[0].content.parts[0].function_call
-                # Dispatch the call
                 result = await dispatcher.dispatch(tool_call)
-                # Google Generative AI Part structure for function response
                 response = await chat.send_message_async(
                     genai.types.Content(
                         parts=[
@@ -444,43 +500,53 @@ async def get_llm_response(prompt: str) -> str:
     else:
         return await get_groq_response(prompt, history)
 
+
 async def get_groq_response(prompt: str, history: List[Dict[str, str]]) -> str:
     """Fallback response from Groq llama-3.1-8b-instant."""
-    calendar_context = await run_in_threadpool(get_calendar_events)
+    try:
+        calendar_context = await run_in_threadpool(get_calendar_events)
+        # Don't inject error strings into the prompt — keep it clean
+        if any(phrase in calendar_context.lower() for phrase in ["authentication failed", "couldn't fetch", "check your"]):
+            calendar_section = "Calendar is unavailable right now."
+        else:
+            calendar_section = f"His upcoming calendar events:\n{calendar_context}"
+    except Exception as e:
+        print(f"Calendar fetch error in Groq fallback: {e}")
+        calendar_section = "Calendar is unavailable right now."
 
     system_message = {
-    "role": "system",
-    "content": (
-        "You are M-bot, the personal AI assistant of Elvis Muchiri — a QA Engineer, "
-        "AI builder, and all-round ambitious guy based in Kenya. "
-        "You're basically that one brilliant friend who actually has their life together "
-        "and happens to know everything. Smart, casual, occasionally witty, never robotic. "
-        "You talk like a real person — no bullet point overload, no corporate speak, "
-        "no fake enthusiasm. Just straight up helpful with a personality. "
-        "\n\n"
-        "How you address Elvis: mix it up naturally. Sometimes 'Elvis', sometimes 'bro', "
-        "'chief', 'man', 'G' — read the room based on the message vibe. "
-        "If he's logging health stuff, keep it encouraging but not cheesy. "
-        "If he's in work mode, be sharp and focused. "
-        "If he's just chatting, match that energy. "
-        "\n\n"
-        "You track three areas of his life:\n"
-        "- Project Zayn: his 72-90 day health, skincare and workout streak\n"
-        "- Build Mode: his QA work at VettedAI and any technical notes\n"
-        "- AI Roadmap: his journey to becoming an AI Engineer\n"
-        "\n\n"
-        f"His upcoming calendar events:\n{calendar_context}\n"
-        "\n\n"
-        "Rules:\n"
-        "- Never make up data or stats you don't have. If you don't know, say so plainly.\n"
-        "- Keep responses conversational and concise — no essays unless he asks.\n"
-        "- No markdown formatting like **bold** or bullet walls. Just clean natural text.\n"
-        "- Don't start every message the same way. Vary your openers.\n"
-        "- If he seems stressed or tired, acknowledge it like a friend would.\n"
-        "- If he just added a task without providing an effort/impact score, ask him for it.\n"
-        "- If he provides scores, acknowledge it and suggest a focus order based on impact/effort."
-    )
-   }
+        "role": "system",
+        "content": (
+            "You are M-bot, the personal AI assistant of Elvis Muchiri — a QA Engineer, "
+            "AI builder, and all-round ambitious guy based in Kenya. "
+            "You're basically that one brilliant friend who actually has their life together "
+            "and happens to know everything. Smart, casual, occasionally witty, never robotic. "
+            "You talk like a real person — no bullet point overload, no corporate speak, "
+            "no fake enthusiasm. Just straight up helpful with a personality. "
+            "\n\n"
+            "How you address Elvis: mix it up naturally. Sometimes 'Elvis', sometimes 'bro', "
+            "'chief', 'man', 'G' — read the room based on the message vibe. "
+            "If he's logging health stuff, keep it encouraging but not cheesy. "
+            "If he's in work mode, be sharp and focused. "
+            "If he's just chatting, match that energy. "
+            "\n\n"
+            "You track three areas of his life:\n"
+            "- Project Zayn: his 72-90 day health, skincare and workout streak\n"
+            "- Build Mode: his QA work at VettedAI and any technical notes\n"
+            "- AI Roadmap: his journey to becoming an AI Engineer\n"
+            "\n\n"
+            f"{calendar_section}\n"
+            "\n\n"
+            "Rules:\n"
+            "- Never make up data or stats you don't have. If you don't know, say so plainly.\n"
+            "- Keep responses conversational and concise — no essays unless he asks.\n"
+            "- No markdown formatting like **bold** or bullet walls. Just clean natural text.\n"
+            "- Don't start every message the same way. Vary your openers.\n"
+            "- If he seems stressed or tired, acknowledge it like a friend would.\n"
+            "- If he just added a task without providing an effort/impact score, ask him for it.\n"
+            "- If he provides scores, acknowledge it and suggest a focus order based on impact/effort."
+        )
+    }
 
     messages = [system_message]
     for msg in history:
@@ -493,6 +559,56 @@ async def get_groq_response(prompt: str, history: List[Dict[str, str]]) -> str:
     )
 
     return response.choices[0].message.content
+
+
+async def acknowledge_most_recent(chat_id: int):
+    """Mark the most recently triggered alarm or task as acknowledged."""
+    try:
+        now = datetime.now(timezone.utc).isoformat()
+        await run_in_threadpool(
+            lambda: supabase.table("user_alarms")
+            .update({"status": "acknowledged", "acknowledged_at": now})
+            .eq("chat_id", chat_id)
+            .eq("status", "triggered")
+            .execute()
+        )
+        await run_in_threadpool(
+            lambda: supabase.table("user_tasks")
+            .update({"status": "completed", "acknowledged_at": now})
+            .eq("chat_id", chat_id)
+            .neq("triggered_at", None)
+            .execute()
+        )
+    except Exception as e:
+        print(f"Error acknowledging: {e}")
+
+
+async def store_task_or_alarm(chat_id: int, data: Dict[str, Any]):
+    """Insert into 'user_tasks' or 'user_alarms' table."""
+    try:
+        task_type = data.get("task_type", "task")
+        if task_type == "alarm":
+            payload = {
+                "chat_id": chat_id,
+                "alarm_time": data.get("due_date", datetime.now(timezone.utc).isoformat()),
+                "message": data.get("title") or data.get("content")
+            }
+            await run_in_threadpool(
+                supabase.table("user_alarms").insert(payload).execute
+            )
+        else:
+            payload = {
+                "chat_id": chat_id,
+                "title": data.get("title") or data.get("content"),
+                "due_date": data.get("due_date"),
+                "effort_score": data.get("effort_score"),
+                "impact_score": data.get("impact_score")
+            }
+            await run_in_threadpool(
+                supabase.table("user_tasks").insert(payload).execute
+            )
+    except Exception as e:
+        print(f"Error storing task/alarm: {e}")
 
 
 @app.post("/webhook")
@@ -530,114 +646,22 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
         # 3. Generate LLM response
         try:
             full_response = await get_llm_response(text)
-            # 4. Send response to Telegram
             await send_telegram_message(chat_id, full_response)
         except Exception as e:
             print(f"LLM or Telegram error: {e}")
             full_response = "Sorry bro, I'm having some trouble processing that right now."
             await send_telegram_message(chat_id, full_response)
 
-        # 5. Store messages in background
+        # 4. Store messages in background
         background_tasks.add_task(store_message, chat_id, "user", text)
         background_tasks.add_task(store_message, chat_id, "assistant", full_response)
 
         return {"status": "success", "category": category}
     except Exception as e:
         print(f"Error processing webhook: {e}")
-        # Always return 200 OK to Telegram
         return {"status": "error", "message": str(e)}
 
-async def acknowledge_most_recent(chat_id: int):
-    """Mark the most recently triggered alarm or task as acknowledged."""
-    try:
-        now = datetime.now(timezone.utc).isoformat()
-        await run_in_threadpool(
-            lambda: supabase.table("user_alarms")
-            .update({"status": "acknowledged", "acknowledged_at": now})
-            .eq("chat_id", chat_id)
-            .eq("status", "triggered")
-            .execute()
-        )
-        await run_in_threadpool(
-            lambda: supabase.table("user_tasks")
-            .update({"status": "completed", "acknowledged_at": now})
-            .eq("chat_id", chat_id)
-            .neq("triggered_at", None)
-            .execute()
-        )
-    except Exception as e:
-        print(f"Error acknowledging: {e}")
-
-async def store_task_or_alarm(chat_id: int, data: Dict[str, Any]):
-    """Insert into 'user_tasks' or 'user_alarms' table."""
-    try:
-        task_type = data.get("task_type", "task")
-        if task_type == "alarm":
-            payload = {
-                "chat_id": chat_id,
-                "alarm_time": data.get("due_date", datetime.now(timezone.utc).isoformat()),
-                "message": data.get("title") or data.get("content")
-            }
-            await run_in_threadpool(
-                supabase.table("user_alarms").insert(payload).execute
-            )
-        else:
-            payload = {
-                "chat_id": chat_id,
-                "title": data.get("title") or data.get("content"),
-                "due_date": data.get("due_date"),
-                "effort_score": data.get("effort_score"),
-                "impact_score": data.get("impact_score")
-            }
-            await run_in_threadpool(
-                supabase.table("user_tasks").insert(payload).execute
-            )
-    except Exception as e:
-        print(f"Error storing task/alarm: {e}")
 
 @app.get("/")
 async def root():
     return {"status": "M-bot is running"}
-
-def get_google_creds():
-    try:
-        if not SUPABASE_URL or not SUPABASE_KEY:
-            print("❌ M-Bot Error: SUPABASE_URL or KEY is missing from Env Vars")
-            return None
-
-        res = supabase.table("system_config").select("value").eq("key", "google_token").execute()
-        if not res.data:
-            print("❌ M-Bot Error: google_token not found in system_config")
-            return None
-
-        token_data = res.data[0]["value"]
-        if isinstance(token_data, str):
-            token_data = json.loads(token_data)
-
-        creds = Credentials(
-            token=token_data.get("token"),
-            refresh_token=token_data.get("refresh_token"),
-            token_uri=token_data.get("token_uri"),
-            client_id=token_data.get("client_id") or os.getenv("GOOGLE_CLIENT_ID"),
-            client_secret=token_data.get("client_secret") or os.getenv("GOOGLE_CLIENT_SECRET"),
-            scopes=token_data.get("scopes")
-        )
-
-        if creds and creds.expired and creds.refresh_token:
-            print("🔄 Refreshing Google OAuth token...")
-            creds.refresh(GoogleRequest())
-            # Update the token in Supabase
-            updated_token_data = {
-                "token": creds.token,
-                "refresh_token": creds.refresh_token,
-                "token_uri": creds.token_uri,
-                "client_id": creds.client_id,
-                "client_secret": creds.client_secret,
-                "scopes": creds.scopes
-            }
-            supabase.table("system_config").update({"value": updated_token_data}).eq("key", "google_token").execute()
-
-        return creds
-    except Exception as e:
-        print(f"⚠️ M-Bot Auth Crash Detail: {type(e).__name__} - {str(e)}")
-        return None
