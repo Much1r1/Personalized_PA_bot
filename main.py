@@ -481,43 +481,17 @@ async def get_groq_response(prompt: str, history: List[Dict[str, str]]) -> str:
 
     return response.choices[0].message.content
 
-def get_calendar_events(max_results: int = 5) -> str:
-    """Queries Google Calendar API with Nairobi Timezone awareness."""
+def get_calendar_events(max_results: int = 10):
+    creds = get_google_creds()
+    if not creds:
+        return "Authentication failed. Check Supabase connection."
+    
     try:
-        creds = get_google_creds()
-        if not creds:
-            return "Authentication error, bro. I can't reach the calendar API right now."
         service = build('calendar', 'v3', credentials=creds)
-
-        # Get current time in Nairobi (UTC+3)
-        nairobi_tz = timezone(timedelta(hours=3))
-        now = datetime.now(nairobi_tz).isoformat()
-
-        events_result = service.events().list(
-            calendarId='primary', 
-            timeMin=now,
-            maxResults=max_results, 
-            singleEvents=True,
-            orderBy='startTime'
-        ).execute()
-        
-        events = events_result.get('items', [])
-
-        if not events:
-            return "Your schedule is clear for the rest of the day, chief."
-
-        event_list = []
-        for event in events:
-            start = event['start'].get('dateTime', event['start'].get('date'))
-            # Format time correctly for EAT
-            display_time = start.split('T')[1][:5] if 'T' in start else "All Day"
-            event_list.append(f"- {display_time}: {event.get('summary')}")
-            
-        return "\n".join(event_list)
-
+        # Add your list logic here
+        return "Successfully connected to Calendar."
     except Exception as e:
-        print(f"Calendar API Error: {e}")
-        return "Couldn't fetch the live schedule. Check the Google token, bro."
+        return f"API Error: {str(e)}"
 
 @app.post("/webhook")
 async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
@@ -615,27 +589,28 @@ async def root():
     return {"status": "M-bot is running"}
 
 def get_google_creds():
-    """Fetches and self-heals the Google token using Supabase."""
     try:
-        # 1. Fetch from Supabase
-        response = supabase.table("system_config").select("value").eq("key", "google_token").single().execute()
-        if not response.data:
-            raise FileNotFoundError("No token found in Supabase table 'system_config'")
+        # 1. Direct fetch from Supabase
+        # Ensure 'supabase' client is initialized globally with your URL/Key
+        res = supabase.table("system_config").select("value").eq("key", "google_token").single().execute()
         
-        token_data = response.data["value"]
-        creds = Credentials.from_authorized_user_info(token_data, SCOPES)
+        if not res.data or "value" not in res.data:
+            print("❌ M-Bot Error: Token not found in Supabase")
+            return None
+            
+        token_info = res.data["value"]
+        creds = Credentials.from_authorized_user_info(token_info, SCOPES)
 
-        # 2. Check if refresh is needed
+        # 2. Force Refresh if expired
         if creds and creds.expired and creds.refresh_token:
-            print("Token expired. Initiating self-healing refresh...")
+            print("🔄 M-Bot: Refreshing expired token...")
             creds.refresh(GoogleRequest())
             
-            # 3. Save the NEW token back to Supabase
-            updated_token_json = json.loads(creds.to_json())
-            supabase.table("system_config").update({"value": updated_token_json}).eq("key", "google_token").execute()
-            print("Token self-healed and saved to Supabase.")
+            # 3. Critical: Update Supabase so it stays healed
+            new_token_data = json.loads(creds.to_json())
+            supabase.table("system_config").update({"value": new_token_data}).eq("key", "google_token").execute()
 
         return creds
     except Exception as e:
-        print(f"Persistent Auth Error: {e}")
+        print(f"⚠️ M-Bot Auth Crash: {str(e)}")
         return None
