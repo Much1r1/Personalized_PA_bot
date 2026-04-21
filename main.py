@@ -479,19 +479,7 @@ async def get_groq_response(prompt: str, history: List[Dict[str, str]]) -> str:
         messages=messages
     )
 
-    return response.choices[0].message.content
-
-def get_calendar_events(max_results: int = 10):
-    creds = get_google_creds()
-    if not creds:
-        return "Authentication failed. Check Supabase connection."
-    
-    try:
-        service = build('calendar', 'v3', credentials=creds)
-        # Add your list logic here
-        return "Successfully connected to Calendar."
-    except Exception as e:
-        return f"API Error: {str(e)}"
+    return response.choices[0].message.contentssss
 
 @app.post("/webhook")
 async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
@@ -590,27 +578,14 @@ async def root():
 
 def get_google_creds():
     try:
-        # 1. Direct fetch from Supabase
-        # Ensure 'supabase' client is initialized globally with your URL/Key
+        # Check if URL/KEY actually exist
+        if not SUPABASE_URL or not SUPABASE_KEY:
+            print("❌ M-Bot Error: SUPABASE_URL or KEY is missing from Env Vars")
+            return None
+
         res = supabase.table("system_config").select("value").eq("key", "google_token").single().execute()
         
-        if not res.data or "value" not in res.data:
-            print("❌ M-Bot Error: Token not found in Supabase")
-            return None
-            
-        token_info = res.data["value"]
-        creds = Credentials.from_authorized_user_info(token_info, SCOPES)
-
-        # 2. Force Refresh if expired
-        if creds and creds.expired and creds.refresh_token:
-            print("🔄 M-Bot: Refreshing expired token...")
-            creds.refresh(GoogleRequest())
-            
-            # 3. Critical: Update Supabase so it stays healed
-            new_token_data = json.loads(creds.to_json())
-            supabase.table("system_config").update({"value": new_token_data}).eq("key", "google_token").execute()
-
-        return creds
+        # ... rest of your code
     except Exception as e:
-        print(f"⚠️ M-Bot Auth Crash: {str(e)}")
+        print(f"⚠️ M-Bot Auth Crash Detail: {type(e).__name__} - {str(e)}")
         return None
