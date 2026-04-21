@@ -485,6 +485,8 @@ def get_calendar_events(max_results: int = 5) -> str:
     """Queries Google Calendar API with Nairobi Timezone awareness."""
     try:
         creds = get_google_creds()
+        if not creds:
+            return "Authentication error, bro. I can't reach the calendar API right now."
         service = build('calendar', 'v3', credentials=creds)
 
         # Get current time in Nairobi (UTC+3)
@@ -612,23 +614,28 @@ async def store_task_or_alarm(chat_id: int, data: Dict[str, Any]):
 async def root():
     return {"status": "M-bot is running"}
 
-async def get_google_creds():
-    # 1. Fetch the latest token from your Supabase 'settings' or 'auth' table
-    response = await run_in_threadpool(
-        lambda: supabase.table("system_config").select("value").eq("key", "google_token").single().execute()
-    )
-    token_data = json.loads(response.data["value"])
-    creds = Credentials.from_authorized_user_info(token_data, SCOPES)
-
-    # 2. If expired, refresh it
-    if creds and creds.expired and creds.refresh_token:
-        from google.auth.transport.requests import Request
-        creds.refresh(Request())
+def get_google_creds():
+    """Fetches and self-heals the Google token using Supabase."""
+    try:
+        # 1. Fetch from Supabase
+        response = supabase.table("system_config").select("value").eq("key", "google_token").single().execute()
+        if not response.data:
+            raise FileNotFoundError("No token found in Supabase table 'system_config'")
         
-        # 3. SAVE the fresh token back to Supabase immediately
-        updated_token = creds.to_json()
-        await run_in_threadpool(
-            lambda: supabase.table("system_config").update({"value": updated_token}).eq("key", "google_token").execute()
-        )
-    
-    return creds
+        token_data = response.data["value"]
+        creds = Credentials.from_authorized_user_info(token_data, SCOPES)
+
+        # 2. Check if refresh is needed
+        if creds and creds.expired and creds.refresh_token:
+            print("Token expired. Initiating self-healing refresh...")
+            creds.refresh(Request())
+            
+            # 3. Save the NEW token back to Supabase
+            updated_token_json = json.loads(creds.to_json())
+            supabase.table("system_config").update({"value": updated_token_json}).eq("key", "google_token").execute()
+            print("Token self-healed and saved to Supabase.")
+
+        return creds
+    except Exception as e:
+        print(f"Persistent Auth Error: {e}")
+        return None
