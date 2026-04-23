@@ -1,5 +1,6 @@
 import json
 from typing import Dict, Any, List
+from datetime import datetime, timezone
 from groq import AsyncGroq
 from supabase import Client
 from fastapi.concurrency import run_in_threadpool
@@ -75,6 +76,15 @@ class IntentClassifier:
 
             task = response.data[0]
             title = task["title"]
+            task_id = task["id"]
+
+            # Update triggered_at to prevent immediate re-nudging by the engine
+            await run_in_threadpool(
+                lambda: self.supabase.table("user_tasks")
+                .update({"triggered_at": datetime.now(timezone.utc).isoformat()})
+                .eq("id", task_id)
+                .execute()
+            )
 
             system_prompt = (
                 "You are M-bot, the personal AI assistant of Elvis Muchiri. "
