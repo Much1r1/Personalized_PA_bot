@@ -12,6 +12,8 @@ from supabase import create_client, Client
 import httpx
 import asyncio
 from dotenv import load_dotenv
+from pomodoro_service import PomodoroService
+from intent_classifier import IntentClassifier
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from datetime import datetime, timezone, timedelta
@@ -30,6 +32,8 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 app = FastAPI(title="M-bot")
 groq_client = AsyncGroq(api_key=GROQ_API_KEY)
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+pomodoro_service = PomodoroService(supabase)
+intent_classifier = IntentClassifier(groq_client, supabase)
 
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
@@ -265,7 +269,30 @@ class NudgeEngine:
                 except Exception as e:
                     print(f"Nudge Engine Task Escalation Error: {e}")
 
-                # 4. System Status Report (8:00 AM)
+                # 4. Handle Pomodoro sessions
+                try:
+                    pomodoro_resp = await run_in_threadpool(
+                        lambda: self.supabase.table("pomodoro_sessions")
+                        .select("*")
+                        .eq("status", "active")
+                        .lte("end_time", now.isoformat())
+                        .execute()
+                    )
+                    for session in pomodoro_resp.data:
+                        chat_id = session["user_id"]
+                        session_type = session["type"]
+                        msg = "🔔 Time's up! Pomodoro session completed. Take a break, G." if session_type == "work" else "🔔 Break's over! Let's get back to it."
+                        await send_telegram_message(chat_id, msg)
+                        await run_in_threadpool(
+                            lambda: self.supabase.table("pomodoro_sessions")
+                            .update({"status": "completed"})
+                            .eq("id", session["id"])
+                            .execute()
+                        )
+                except Exception as e:
+                    print(f"Nudge Engine Pomodoro Error: {e}")
+
+                # 5. System Status Report (8:00 AM)
                 if now.hour == 8 and now.minute == 0:
                     active_chats = await run_in_threadpool(
                         lambda: self.supabase.table("messages")
@@ -312,50 +339,6 @@ async def startup_event():
     asyncio.create_task(nudge_engine_service.run())
 
 
-async def classify_intent(text: str) -> Dict[str, Any]:
-    """
-    Classify the user intent using Groq.
-    Categories: 'Project Zayn', 'Build Mode', 'AI Roadmap', 'Task', 'Acknowledge'
-    """
-    system_prompt = """
-    You are an intent classifier for M-bot, a personal AI PA.
-    Classify the user's message into one of these five categories:
-    1. 'Project Zayn': Health, skincare, or workout logs.
-    2. 'Build Mode': Vetted-QA tasks or technical code notes.
-    3. 'AI Roadmap': Tracking progress on AI Engineering milestones.
-    4. 'Task': User wants to add a new task or alarm.
-    5. 'Acknowledge': User is acknowledging an alert, alarm or task (e.g., 'done', 'ack', 'got it').
-
-    For 'Project Zayn', also detect if they mentioned completing skincare or workout.
-    For 'Task', extract the 'title', 'due_date' (if any, in ISO format), and 'task_type' (task or alarm).
-    Also for 'Task', extract 'effort_score' (1-10) and 'impact_score' (1-10) if mentioned.
-    Return ONLY a raw JSON object with no markdown or backticks:
-    {
-        "category": "Project Zayn" | "Build Mode" | "AI Roadmap" | "Task" | "Acknowledge",
-        "skincare_done": boolean (only for Project Zayn),
-        "workout_done": boolean (only for Project Zayn),
-        "title": "string" (only for Task),
-        "due_date": "ISO string" (only for Task),
-        "task_type": "task" | "alarm" (only for Task),
-        "effort_score": integer (only for Task),
-        "impact_score": integer (only for Task),
-        "content": "The original or cleaned up message content"
-    }
-    """
-
-    try:
-        response = await groq_client.chat.completions.create(
-            model="llama-3.1-8b-instant",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": text}
-            ],
-            response_format={"type": "json_object"}
-        )
-        return json.loads(response.choices[0].message.content)
-    except Exception as e:
-        print(f"Error classifying intent: {e}")
-        return {"category": "Unknown", "content": text}
 
 
 async def store_project_zayn(data: Dict[str, Any]):
@@ -625,9 +608,30 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
 
         current_chat_id.set(chat_id)
 
+        # 0. Handle Commands
+        if text.startswith("/"):
+            if text.startswith("/pomodoro"):
+                await pomodoro_service.start_session(chat_id)
+                await send_telegram_message(chat_id, "🚀 Pomodoro started! 25 minutes of deep work begins now. Focus, bro.")
+                return {"status": "success", "command": "pomodoro"}
+            elif text.startswith("/p_stop"):
+                await pomodoro_service.stop_session(chat_id)
+                await send_telegram_message(chat_id, "🛑 Pomodoro stopped. Rest up.")
+                return {"status": "success", "command": "p_stop"}
+            elif text.startswith("/p_status"):
+                session = await pomodoro_service.get_active_session(chat_id)
+                if session:
+                    end_time = datetime.fromisoformat(session["end_time"].replace('Z', '+00:00'))
+                    remaining = end_time - datetime.now(timezone.utc)
+                    minutes = int(remaining.total_seconds() // 60)
+                    await send_telegram_message(chat_id, f"⏳ {minutes} minutes remaining in your current session. Keep pushing!")
+                else:
+                    await send_telegram_message(chat_id, "No active Pomodoro session. Use /pomodoro to start one.")
+                return {"status": "success", "command": "p_status"}
+
         # 1. Classify Intent
         try:
-            classification = await classify_intent(text)
+            classification = await intent_classifier.classify(text)
             category = classification.get("category")
 
             # 2. Specialized storage based on category
@@ -639,6 +643,10 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
                 background_tasks.add_task(store_task_or_alarm, chat_id, classification)
             elif category == "Acknowledge":
                 background_tasks.add_task(acknowledge_most_recent, chat_id)
+            elif category == "Nudge":
+                nudge_msg = await intent_classifier.get_nudge_message(chat_id)
+                await send_telegram_message(chat_id, nudge_msg)
+                return {"status": "success", "category": "Nudge"}
         except Exception as e:
             print(f"Classification or specialized storage error: {e}")
             category = "Unknown"
