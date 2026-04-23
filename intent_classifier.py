@@ -56,7 +56,7 @@ class IntentClassifier:
             print(f"Error classifying intent: {e}")
             return {"category": "Unknown", "content": text}
 
-    async def get_nudge_message(self, chat_id: int) -> str:
+    async def get_nudge_message(self, chat_id: str) -> str:
         """
         Fetches the oldest pending task and formats a 'gentle but firm' nudge message.
         """

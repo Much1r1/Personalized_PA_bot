@@ -39,7 +39,7 @@ if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
 
 # Context variable to store chat_id
-current_chat_id: ContextVar[int] = ContextVar("current_chat_id")
+current_chat_id: ContextVar[str] = ContextVar("current_chat_id")
 
 
 def get_google_creds():
@@ -229,6 +229,7 @@ class NudgeEngine:
                         .eq("status", "pending")
                         .lte("due_date", now.isoformat())
                         .is_("triggered_at", "null")
+                        .is_("acknowledged_at", "null")
                         .execute()
                     )
                     for task in tasks_resp.data:
@@ -370,7 +371,7 @@ async def store_dev_milestone(category: str, data: Dict[str, Any]):
         print(f"Error storing dev milestone: {e}")
 
 
-async def fetch_chat_history(chat_id: int) -> List[Dict[str, str]]:
+async def fetch_chat_history(chat_id: str) -> List[Dict[str, str]]:
     """Fetch the last 15 messages for the current chat_id from Supabase."""
     try:
         response = await run_in_threadpool(
@@ -387,7 +388,7 @@ async def fetch_chat_history(chat_id: int) -> List[Dict[str, str]]:
         return []
 
 
-async def store_message(chat_id: int, role: str, content: str):
+async def store_message(chat_id: str, role: str, content: str):
     """Store a message in the 'messages' table."""
     try:
         payload = {"chat_id": chat_id, "role": role, "content": content}
@@ -398,11 +399,14 @@ async def store_message(chat_id: int, role: str, content: str):
         print(f"Error storing message: {e}")
 
 
-async def send_telegram_message(chat_id: int, text: str):
+async def send_telegram_message(chat_id: str, text: str, reply_to_message_id: Optional[int] = None):
     """Send a message back to the Telegram chat."""
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
         payload = {"chat_id": chat_id, "text": text}
+        if reply_to_message_id:
+            payload["reply_to_message_id"] = reply_to_message_id
+
         async with httpx.AsyncClient() as client:
             response = await client.post(url, json=payload)
             response.raise_for_status()
@@ -544,7 +548,7 @@ async def get_groq_response(prompt: str, history: List[Dict[str, str]]) -> str:
     return response.choices[0].message.content
 
 
-async def acknowledge_most_recent(chat_id: int):
+async def acknowledge_most_recent(chat_id: str):
     """Mark the most recently triggered alarm or task as acknowledged."""
     try:
         now = datetime.now(timezone.utc).isoformat()
@@ -566,7 +570,7 @@ async def acknowledge_most_recent(chat_id: int):
         print(f"Error acknowledging: {e}")
 
 
-async def store_task_or_alarm(chat_id: int, data: Dict[str, Any]):
+async def store_task_or_alarm(chat_id: str, data: Dict[str, Any]):
     """Insert into 'user_tasks' or 'user_alarms' table."""
     try:
         task_type = data.get("task_type", "task")
@@ -603,23 +607,28 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
         if not message or "text" not in message:
             return {"status": "No text message to process"}
 
-        chat_id = message["chat"]["id"]
+        chat_id = str(message["chat"]["id"])
+        user_id = str(message.get("from", {}).get("id", chat_id))
         text = message["text"]
 
         current_chat_id.set(chat_id)
 
         # 0. Handle Commands
         if text.startswith("/"):
+            message_id = message.get("message_id")
             if text.startswith("/pomodoro"):
-                await pomodoro_service.start_session(chat_id)
-                await send_telegram_message(chat_id, "🚀 Pomodoro started! 25 minutes of deep work begins now. Focus, bro.")
+                try:
+                    await pomodoro_service.start_session(user_id)
+                    await send_telegram_message(chat_id, "🚀 Pomodoro started! 25 minutes of deep work begins now. Focus, bro.")
+                except Exception as e:
+                    await send_telegram_message(chat_id, f"❌ Pomodoro failed: {str(e)}", reply_to_message_id=message_id)
                 return {"status": "success", "command": "pomodoro"}
             elif text.startswith("/p_stop"):
-                await pomodoro_service.stop_session(chat_id)
+                await pomodoro_service.stop_session(user_id)
                 await send_telegram_message(chat_id, "🛑 Pomodoro stopped. Rest up.")
                 return {"status": "success", "command": "p_stop"}
             elif text.startswith("/p_status"):
-                session = await pomodoro_service.get_active_session(chat_id)
+                session = await pomodoro_service.get_active_session(user_id)
                 if session:
                     end_time = datetime.fromisoformat(session["end_time"].replace('Z', '+00:00'))
                     remaining = end_time - datetime.now(timezone.utc)
