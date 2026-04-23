@@ -6,7 +6,7 @@ class PomodoroService:
     def __init__(self, supabase_client: Client):
         self.supabase = supabase_client
 
-    async def start_session(self, user_id: int, duration_minutes: int = 25, task_id: Optional[int] = None, session_type: str = 'work') -> Dict[str, Any]:
+    async def start_session(self, user_id: str, duration_minutes: int = 25, task_id: Optional[int] = None, session_type: str = 'work') -> Dict[str, Any]:
         """Starts a new Pomodoro session, cancelling any active ones."""
         await self.stop_session(user_id)
 
@@ -25,7 +25,7 @@ class PomodoroService:
         response = self.supabase.table("pomodoro_sessions").insert(payload).execute()
         return response.data[0]
 
-    async def stop_session(self, user_id: int) -> bool:
+    async def stop_session(self, user_id: str) -> bool:
         """Cancels any active Pomodoro sessions for the user."""
         response = self.supabase.table("pomodoro_sessions") \
             .update({"status": "cancelled"}) \
@@ -34,7 +34,7 @@ class PomodoroService:
             .execute()
         return len(response.data) > 0
 
-    async def get_active_session(self, user_id: int) -> Optional[Dict[str, Any]]:
+    async def get_active_session(self, user_id: str) -> Optional[Dict[str, Any]]:
         """Retrieves the current active session for a user."""
         response = self.supabase.table("pomodoro_sessions") \
             .select("*") \
