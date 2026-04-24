@@ -27,6 +27,7 @@ SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+MUCHIRI_CHAT_ID = os.getenv("MUCHIRI_CHAT_ID")
 
 # Initialize Clients
 app = FastAPI(title="M-bot")
@@ -136,6 +137,10 @@ def get_calendar_events(max_results: int = 5) -> str:
 def get_schedule(max_results: int = 5) -> str:
     """Retrieves the user's upcoming calendar events."""
     return get_calendar_events(max_results)
+
+
+class NudgeRequest(BaseModel):
+    message: Optional[str] = "Yo Muchiri, just checking in!"
 
 
 class FunctionDispatcher:
@@ -435,10 +440,11 @@ async def get_llm_response(prompt: str) -> str:
                 "If he's in work mode, be sharp and focused. "
                 "If he's just chatting, match that energy. "
                 "\n\n"
-                "You track three areas of his life:\n"
-                "- Project Zayn: his 72-90 day health, skincare and workout streak\n"
-                "- Build Mode: his QA work at VettedAI and any technical notes\n"
-                "- AI Roadmap: his journey to becoming an AI Engineer\n"
+                "You track these areas of his life:\n"
+                "- Project Zayn: his health, fitness, skincare and workout streak\n"
+                "- Build Mode: his technical work, coding and engineering notes\n"
+                "- AI Roadmap: his journey to becoming an AI Engineering expert\n"
+                "- Kijiji: his side hustles and marketplace activities\n"
                 "\n\n"
                 "You have access to tools to fetch his schedule.\n"
                 "\n\n"
@@ -517,10 +523,11 @@ async def get_groq_response(prompt: str, history: List[Dict[str, str]]) -> str:
             "If he's in work mode, be sharp and focused. "
             "If he's just chatting, match that energy. "
             "\n\n"
-            "You track three areas of his life:\n"
-            "- Project Zayn: his 72-90 day health, skincare and workout streak\n"
-            "- Build Mode: his QA work at VettedAI and any technical notes\n"
-            "- AI Roadmap: his journey to becoming an AI Engineer\n"
+            "You track these areas of his life:\n"
+            "- Project Zayn: his health, fitness, skincare and workout streak\n"
+            "- Build Mode: his technical work, coding and engineering notes\n"
+            "- AI Roadmap: his journey to becoming an AI Engineering expert\n"
+            "- Kijiji: his side hustles and marketplace activities\n"
             "\n\n"
             f"{calendar_section}\n"
             "\n\n"
@@ -677,6 +684,18 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
     except Exception as e:
         print(f"Error processing webhook: {e}")
         return {"status": "error", "message": str(e)}
+
+
+@app.post("/nudge")
+async def manual_nudge(request: NudgeRequest, background_tasks: BackgroundTasks):
+    """
+    Explicitly trigger a nudge message to Muchiri.
+    """
+    if not MUCHIRI_CHAT_ID:
+        raise HTTPException(status_code=500, detail="MUCHIRI_CHAT_ID not configured")
+
+    background_tasks.add_task(send_telegram_message, MUCHIRI_CHAT_ID, request.message)
+    return {"status": "nudge_enqueued", "message": request.message}
 
 
 @app.get("/")

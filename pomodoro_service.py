@@ -14,7 +14,7 @@ class PomodoroService:
         end_time = start_time + timedelta(minutes=duration_minutes)
 
         payload = {
-            "user_id": user_id,
+            "user_id": str(user_id),
             "task_id": task_id,
             "start_time": start_time.isoformat(),
             "end_time": end_time.isoformat(),

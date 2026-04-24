@@ -17,20 +17,21 @@ class IntentClassifier:
         """
         system_prompt = """
         You are an intent classifier for M-bot, a personal AI PA.
-        Classify the user's message into one of these six categories:
-        1. 'Project Zayn': Health, skincare, or workout logs.
-        2. 'Build Mode': Vetted-QA tasks or technical code notes.
+        Classify the user's message into one of these seven categories:
+        1. 'Project Zayn': Health, fitness, skincare, or workout logs.
+        2. 'Build Mode': General technical work, coding, or engineering notes.
         3. 'AI Roadmap': Tracking progress on AI Engineering milestones.
-        4. 'Task': User wants to add a new task or alarm.
-        5. 'Acknowledge': User is acknowledging an alert, alarm or task (e.g., 'done', 'ack', 'got it').
-        6. 'Nudge': User is asking for a nudge, checking what they should do next, or needs motivation to get back to work.
+        4. 'Kijiji': Marketplace activities, side hustles, or buying/selling things.
+        5. 'Task': User wants to add a new task or alarm.
+        6. 'Acknowledge': User is acknowledging an alert, alarm or task (e.g., 'done', 'ack', 'got it').
+        7. 'Nudge': User is asking for a nudge, checking what they should do next, or needs motivation to get back to work.
 
         For 'Project Zayn', also detect if they mentioned completing skincare or workout.
         For 'Task', extract the 'title', 'due_date' (if any, in ISO format), and 'task_type' (task or alarm).
         Also for 'Task', extract 'effort_score' (1-10) and 'impact_score' (1-10) if mentioned.
         Return ONLY a raw JSON object with no markdown or backticks:
         {
-            "category": "Project Zayn" | "Build Mode" | "AI Roadmap" | "Task" | "Acknowledge" | "Nudge",
+            "category": "Project Zayn" | "Build Mode" | "AI Roadmap" | "Kijiji" | "Task" | "Acknowledge" | "Nudge",
             "skincare_done": boolean (only for Project Zayn),
             "workout_done": boolean (only for Project Zayn),
             "title": "string" (only for Task),
