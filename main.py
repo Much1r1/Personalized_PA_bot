@@ -17,6 +17,10 @@ from intent_classifier import IntentClassifier
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from datetime import datetime, timezone, timedelta
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:
+    from backports.zoneinfo import ZoneInfo
 from google.auth.transport.requests import Request as GoogleRequest
 
 load_dotenv()
@@ -41,6 +45,9 @@ if GEMINI_API_KEY:
 
 # Context variable to store chat_id
 current_chat_id: ContextVar[str] = ContextVar("current_chat_id")
+
+# State for proactive nudges
+last_nudge_sent_at: Optional[datetime] = None
 
 
 def get_google_creds():
@@ -107,10 +114,13 @@ def get_calendar_events(max_results: int = 5) -> str:
 
         service = build('calendar', 'v3', credentials=creds)
 
-        now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        # Sync to Africa/Nairobi
+        now_nairobi = datetime.now(ZoneInfo("Africa/Nairobi"))
+        now_iso = now_nairobi.isoformat()
+
         events_result = service.events().list(
             calendarId='primary',
-            timeMin=now,
+            timeMin=now_iso,
             maxResults=max_results,
             singleEvents=True,
             orderBy='startTime'
@@ -340,9 +350,67 @@ class NudgeEngine:
 nudge_engine_service = NudgeEngine(supabase)
 
 
+class VettedNudgeEngine:
+    def __init__(self, supabase_client: Client, pomodoro_svc: PomodoroService):
+        self.supabase = supabase_client
+        self.pomodoro_service = pomodoro_svc
+
+    async def run(self):
+        """
+        Background task that checks for pending 'Vetted' tasks every 1 hour.
+        Aborts if Muchiri is in a Pomodoro session or was recently messaged.
+        """
+        if not MUCHIRI_CHAT_ID:
+            print("⚠️ Vetted Nudge Engine: MUCHIRI_CHAT_ID not set. Skipping.")
+            return
+
+        while True:
+            try:
+                # 1. Check Pomodoro Status
+                active_session = await self.pomodoro_service.get_active_session(MUCHIRI_CHAT_ID)
+                if active_session:
+                    print("🤫 Muchiri is in deep work (Pomodoro). Aborting Vetted nudge.")
+                else:
+                    # 2. Check Recent Interaction (30-minute rule)
+                    now = datetime.now(timezone.utc)
+                    if last_nudge_sent_at and (now - last_nudge_sent_at) < timedelta(minutes=30):
+                        print("⏳ Recent interaction detected. Aborting Vetted nudge.")
+                    else:
+                        # 3. Check for pending Vetted tasks
+                        res = await run_in_threadpool(
+                            lambda: self.supabase.table("user_tasks")
+                            .select("*")
+                            .eq("status", "pending")
+                            .ilike("title", "%Vetted%")
+                            .execute()
+                        )
+
+                        if res.data:
+                            count = len(res.data)
+                            task_title = res.data[0]["title"]
+                            msg = f"Yo Elvis, you've got {count} pending Vetted ticket{'s' if count > 1 else ''}. Focus on: {task_title}"
+                            if count > 1:
+                                msg += f" and {count-1} more."
+
+                            await send_telegram_message(MUCHIRI_CHAT_ID, msg)
+                            print(f"✅ Proactive Vetted nudge sent for {count} tasks.")
+                        else:
+                            print("✅ No pending Vetted tasks found.")
+
+            except Exception as e:
+                print(f"❌ Vetted Nudge Engine Error: {e}")
+
+            # Sleep for 1 hour
+            await asyncio.sleep(3600)
+
+
+vetted_nudge_service = VettedNudgeEngine(supabase, pomodoro_service)
+
+
 @app.on_event("startup")
 async def startup_event():
     asyncio.create_task(nudge_engine_service.run())
+    asyncio.create_task(vetted_nudge_service.run())
 
 
 
@@ -406,6 +474,7 @@ async def store_message(chat_id: str, role: str, content: str):
 
 async def send_telegram_message(chat_id: str, text: str, reply_to_message_id: Optional[int] = None):
     """Send a message back to the Telegram chat."""
+    global last_nudge_sent_at
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
         payload = {"chat_id": chat_id, "text": text}
@@ -415,6 +484,10 @@ async def send_telegram_message(chat_id: str, text: str, reply_to_message_id: Op
         async with httpx.AsyncClient() as client:
             response = await client.post(url, json=payload)
             response.raise_for_status()
+
+            # Update last_nudge_sent_at if it's for Muchiri
+            if chat_id == MUCHIRI_CHAT_ID:
+                last_nudge_sent_at = datetime.now(timezone.utc)
     except Exception as e:
         print(f"Error sending Telegram message: {e}")
 
@@ -423,10 +496,12 @@ async def get_llm_response(prompt: str) -> str:
     """Get response from Gemini with tool calling support, fallback to Groq."""
     chat_id = current_chat_id.get()
     history = await fetch_chat_history(chat_id)
+    now_nairobi = datetime.now(ZoneInfo("Africa/Nairobi")).strftime("%Y-%m-%d %H:%M:%S")
 
     if GEMINI_API_KEY:
         try:
             system_instruction = (
+                f"Current time: {now_nairobi} (Africa/Nairobi)\n\n"
                 "You are M-bot, the personal AI assistant of Elvis Muchiri — a QA Engineer, "
                 "AI builder, and all-round ambitious guy based in Kenya. "
                 "You're basically that one brilliant friend who actually has their life together "
@@ -496,6 +571,7 @@ async def get_llm_response(prompt: str) -> str:
 
 async def get_groq_response(prompt: str, history: List[Dict[str, str]]) -> str:
     """Fallback response from Groq llama-3.1-8b-instant."""
+    now_nairobi = datetime.now(ZoneInfo("Africa/Nairobi")).strftime("%Y-%m-%d %H:%M:%S")
     try:
         calendar_context = await run_in_threadpool(get_calendar_events)
         # Don't inject error strings into the prompt — keep it clean
@@ -510,6 +586,7 @@ async def get_groq_response(prompt: str, history: List[Dict[str, str]]) -> str:
     system_message = {
         "role": "system",
         "content": (
+            f"Current time: {now_nairobi} (Africa/Nairobi)\n\n"
             "You are M-bot, the personal AI assistant of Elvis Muchiri — a QA Engineer, "
             "AI builder, and all-round ambitious guy based in Kenya. "
             "You're basically that one brilliant friend who actually has their life together "
