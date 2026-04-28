@@ -483,11 +483,12 @@ class NudgeEngine:
                         .execute()
                     )
                     for session in pomodoro_resp.data:
-                        chat_id = session["user_id"]
+                        # Use chat_id if available, fallback to user_id
+                        target_chat_id = session.get("chat_id") or session["user_id"]
                         session_type = session["type"]
                         msg = "🔔 Time's up! Pomodoro session completed. Take a break, G." if session_type == "work" else "🔔 Break's over! Let's get back to it."
-                        await send_telegram_message(chat_id, msg)
-                        await update_user_state(chat_id, pomodoro_active=False)
+                        await send_telegram_message(target_chat_id, msg, reminder_type="pomodoro_alert")
+                        await update_user_state(target_chat_id, pomodoro_active=False)
                         await run_in_threadpool(
                             lambda: self.supabase.table("pomodoro_sessions")
                             .update({"status": "completed"})
@@ -724,8 +725,8 @@ async def send_telegram_message(chat_id: str, text: str, reply_to_message_id: Op
     try:
         # Proactive Nudge Guard: Check for Cool-down and Mute
         if reminder_type and chat_id == MUCHIRI_CHAT_ID:
-            # Alarms and Morning Briefing bypass mute and cooldown
-            if reminder_type not in ["alarm", "alarm_escalation", "morning_briefing"]:
+            # Alarms, Morning Briefing, and Pomodoro Alerts bypass mute and cooldown
+            if reminder_type not in ["alarm", "alarm_escalation", "morning_briefing", "pomodoro_alert"]:
                 now = datetime.now(ZoneInfo("Africa/Nairobi"))
 
                 # 1. 1-hour Cool-down check
@@ -990,7 +991,7 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
             message_id = message.get("message_id")
             if text.startswith("/pomodoro"):
                 try:
-                    await pomodoro_service.start_session(user_id)
+                    await pomodoro_service.start_session(user_id, chat_id=chat_id)
                     await update_user_state(chat_id, pomodoro_active=True)
                     await send_telegram_message(chat_id, "🚀 Pomodoro started! 25 minutes of deep work begins now. Focus, bro.")
                 except Exception as e:

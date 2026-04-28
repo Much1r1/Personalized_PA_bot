@@ -73,6 +73,11 @@ async def test_send_telegram_message_mute(mock_post, mock_get_state):
     await main.send_telegram_message("12345", "Alarm", reminder_type="alarm")
     assert mock_post.called
 
+    # Pomodoro alert should bypass mute
+    mock_post.reset_mock()
+    await main.send_telegram_message("12345", "Pomodoro Done", reminder_type="pomodoro_alert")
+    assert mock_post.called
+
 @pytest.mark.anyio
 @patch("main.intent_classifier.classify")
 @patch("main.get_llm_response")
