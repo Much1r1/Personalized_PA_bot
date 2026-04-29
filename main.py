@@ -11,6 +11,7 @@ import google.generativeai as genai
 from supabase import create_client, Client
 import httpx
 import asyncio
+import re
 from dotenv import load_dotenv
 from pomodoro_service import PomodoroService
 from intent_classifier import IntentClassifier
@@ -60,14 +61,24 @@ async def get_user_state(chat_id: str) -> Dict[str, Any]:
             return res.data[0]
 
         # Create default state if missing
-        default_state = {"chat_id": chat_id, "pomodoro_active": False}
+        default_state = {
+            "chat_id": chat_id,
+            "pomodoro_active": False,
+            "is_muted": False,
+            "muted_until": None
+        }
         res = await run_in_threadpool(
             lambda: supabase.table("user_state").insert(default_state).execute()
         )
         return res.data[0]
     except Exception as e:
         print(f"Error fetching user state: {e}")
-        return {"chat_id": chat_id, "pomodoro_active": False}
+        return {
+            "chat_id": chat_id,
+            "pomodoro_active": False,
+            "is_muted": False,
+            "muted_until": None
+        }
 
 
 async def update_user_state(chat_id: str, **kwargs):
@@ -472,11 +483,12 @@ class NudgeEngine:
                         .execute()
                     )
                     for session in pomodoro_resp.data:
-                        chat_id = session["user_id"]
+                        # Use chat_id if available, fallback to user_id
+                        target_chat_id = session.get("chat_id") or session["user_id"]
                         session_type = session["type"]
                         msg = "🔔 Time's up! Pomodoro session completed. Take a break, G." if session_type == "work" else "🔔 Break's over! Let's get back to it."
-                        await send_telegram_message(chat_id, msg)
-                        await update_user_state(chat_id, pomodoro_active=False)
+                        await send_telegram_message(target_chat_id, msg, reminder_type="pomodoro_alert")
+                        await update_user_state(target_chat_id, pomodoro_active=False)
                         await run_in_threadpool(
                             lambda: self.supabase.table("pomodoro_sessions")
                             .update({"status": "completed"})
@@ -711,6 +723,28 @@ async def send_telegram_message(chat_id: str, text: str, reply_to_message_id: Op
     """Send a message back to the Telegram chat."""
     global last_nudge_sent_at
     try:
+        # Proactive Nudge Guard: Check for Cool-down and Mute
+        if reminder_type and chat_id == MUCHIRI_CHAT_ID:
+            # Alarms, Morning Briefing, and Pomodoro Alerts bypass mute and cooldown
+            if reminder_type not in ["alarm", "alarm_escalation", "morning_briefing", "pomodoro_alert"]:
+                now = datetime.now(ZoneInfo("Africa/Nairobi"))
+
+                # 1. 1-hour Cool-down check
+                if last_nudge_sent_at:
+                    if (now - last_nudge_sent_at) < timedelta(hours=1):
+                        print(f"🤫 Cool-down active. Last nudge was {(now - last_nudge_sent_at).total_seconds()/60:.1f}m ago. Skipping {reminder_type}.")
+                        return
+
+                # 2. Global Mute check
+                state = await get_user_state(chat_id)
+                if state.get("is_muted"):
+                    muted_until_str = state.get("muted_until")
+                    if muted_until_str:
+                        muted_until = datetime.fromisoformat(muted_until_str)
+                        if now < muted_until:
+                            print(f"🤫 User is muted until {muted_until_str}. Skipping {reminder_type}.")
+                            return
+
         # Check for duplicate reminders
         if reminder_type:
             if await should_skip_reminder(chat_id, reminder_type, text):
@@ -730,8 +764,8 @@ async def send_telegram_message(chat_id: str, text: str, reply_to_message_id: Op
             if reminder_type:
                 await log_sent_reminder(chat_id, reminder_type, text)
 
-            # Update last_nudge_sent_at if it's for Muchiri
-            if chat_id == MUCHIRI_CHAT_ID:
+            # Update last_nudge_sent_at if it's a proactive nudge for Muchiri
+            if chat_id == MUCHIRI_CHAT_ID and reminder_type:
                 last_nudge_sent_at = datetime.now(ZoneInfo("Africa/Nairobi"))
     except Exception as e:
         print(f"Error sending Telegram message: {e}")
@@ -957,7 +991,7 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
             message_id = message.get("message_id")
             if text.startswith("/pomodoro"):
                 try:
-                    await pomodoro_service.start_session(user_id)
+                    await pomodoro_service.start_session(user_id, chat_id=chat_id)
                     await update_user_state(chat_id, pomodoro_active=True)
                     await send_telegram_message(chat_id, "🚀 Pomodoro started! 25 minutes of deep work begins now. Focus, bro.")
                 except Exception as e:
@@ -978,6 +1012,11 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
                 else:
                     await send_telegram_message(chat_id, "No active Pomodoro session. Use /pomodoro to start one.")
                 return {"status": "success", "command": "p_status"}
+            elif text.startswith("/mute"):
+                muted_until = (datetime.now(ZoneInfo("Africa/Nairobi")) + timedelta(hours=8)).isoformat()
+                await update_user_state(chat_id, is_muted=True, muted_until=muted_until)
+                await send_telegram_message(chat_id, "🔇 Global Mute active. I'll stay quiet for the next 8 hours, chief. Only alarms will get through.")
+                return {"status": "success", "command": "mute"}
 
         # 1. Classify Intent
         try:
@@ -994,9 +1033,13 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
             elif category == "Acknowledge":
                 background_tasks.add_task(acknowledge_most_recent, chat_id)
             elif category == "Nudge":
-                nudge_msg = await intent_classifier.get_nudge_message(chat_id)
-                await send_telegram_message(chat_id, nudge_msg)
-                return {"status": "success", "category": "Nudge"}
+                # Intent Guard: Disable automated nudge if message contains question mark or inquiry words
+                if re.search(r"\?|how|why|what", text, re.IGNORECASE):
+                    print(f"🛡️ Intent Guard: Inquiry detected in nudge request. Skipping automated nudge for '{text}'.")
+                else:
+                    nudge_msg = await intent_classifier.get_nudge_message(chat_id)
+                    await send_telegram_message(chat_id, nudge_msg, reminder_type="manual_nudge_request")
+                    return {"status": "success", "category": "Nudge"}
         except Exception as e:
             print(f"Classification or specialized storage error: {e}")
             category = "Unknown"

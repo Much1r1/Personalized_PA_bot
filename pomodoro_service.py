@@ -21,7 +21,7 @@ class PomodoroService:
             namespace = uuid.NAMESPACE_DNS
             return str(uuid.uuid5(namespace, f"telegram:{user_id}"))
 
-    async def start_session(self, user_id: str, duration_minutes: int = 25, task_id: Optional[int] = None, session_type: str = 'work') -> Dict[str, Any]:
+    async def start_session(self, user_id: str, duration_minutes: int = 25, task_id: Optional[int] = None, session_type: str = 'work', chat_id: Optional[str] = None) -> Dict[str, Any]:
         """Starts a new Pomodoro session, cancelling any active ones."""
         formatted_user_id = self._get_user_id(user_id)
         await self.stop_session(user_id)
@@ -31,6 +31,7 @@ class PomodoroService:
 
         payload = {
             "user_id": formatted_user_id,
+            "chat_id": chat_id or str(user_id),
             "task_id": task_id,
             "start_time": start_time.isoformat(),
             "end_time": end_time.isoformat(),
