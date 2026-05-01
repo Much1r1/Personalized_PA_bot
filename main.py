@@ -615,35 +615,60 @@ class ExecutiveSyncService:
                     print(f"🔄 Block state updated: {current_block_type} ({current_block_id})")
 
                 # 3. The 'Suspicious Silence' Nudge
-                if previous_block_type and not current_block_type:
-                    # A block just ended. We need to track WHEN it ended.
-                    # We'll use a local 'last_block_ended_at' or check if it's already in ctx
-                    # For simplicity, if we see a transition from block to no-block,
-                    # we can set a timer or check 'updated_at' of the context.
-                    # Actually, let's use last_suspicious_silence_at as the "cooldown"
-                    pass # Handled by checking time since context update
-
-                if not current_block_type and previous_block_type is None:
-                    # Check if a block ended recently (within 15-20 mins)
-                    # We can use updated_at to see when current_block_type became None
+                if not current_block_type:
+                    # Check if a block ended recently (more than 15 mins ago)
+                    # We use updated_at to see when current_block_type became None
                     updated_at_str = ctx.get("updated_at")
                     if updated_at_str:
                         updated_at = datetime.fromisoformat(updated_at_str)
                         # If block ended more than 15 mins ago
-                        if (now - updated_at) >= timedelta(minutes=15) and (now - updated_at) < timedelta(minutes=16):
-                            # Check last interaction
-                            state = await get_user_state(self.chat_id)
-                            last_interaction_str = state.get("last_user_interaction_at")
-                            last_interaction = datetime.fromisoformat(last_interaction_str) if last_interaction_str else datetime.min.replace(tzinfo=ZoneInfo("Africa/Nairobi"))
+                        if (now - updated_at) >= timedelta(minutes=15):
+                            # Check if we already nudged for this silence
+                            last_silence_nudge_str = ctx.get("last_suspicious_silence_at")
+                            last_silence_nudge = datetime.fromisoformat(last_silence_nudge_str) if last_silence_nudge_str else datetime.min.replace(tzinfo=ZoneInfo("Africa/Nairobi"))
 
-                            if last_interaction < updated_at:
-                                # 3-hour suppression check for Suspicious Silence
-                                if (now - last_interaction) >= timedelta(hours=3):
-                                    # User hasn't messaged since block ended and it's been > 3 hours
-                                    msg = f"Block ended at {updated_at.strftime('%H:%M')}. How did it go? Send an update to stay on track."
-                                    msg += await self._get_vetted_ps()
-                                    await send_telegram_message(self.chat_id, msg, reminder_type="suspicious_silence")
-                                    print("🧐 Suspicious Silence Nudge sent.")
+                            if last_silence_nudge < updated_at:
+                                # Check last interaction
+                                state = await get_user_state(self.chat_id)
+                                last_interaction_str = state.get("last_user_interaction_at")
+                                last_interaction = datetime.fromisoformat(last_interaction_str) if last_interaction_str else datetime.min.replace(tzinfo=ZoneInfo("Africa/Nairobi"))
+
+                                if last_interaction < updated_at:
+                                    # 3-hour suppression check for Suspicious Silence
+                                    if (now - last_interaction) >= timedelta(hours=3):
+                                        # User hasn't messaged since block ended and it's been > 3 hours
+                                        msg = f"Block ended at {updated_at.strftime('%H:%M')}. How did it go? Send an update to stay on track."
+                                        msg += await self._get_vetted_ps()
+                                        await send_telegram_message(self.chat_id, msg, reminder_type="suspicious_silence")
+                                        await update_user_context(self.chat_id, last_suspicious_silence_at=now.isoformat())
+                                        print("🧐 Suspicious Silence Nudge sent.")
+
+                # 4. General Inactivity Nudge (MIA for 6+ hours)
+                if 9 <= now.hour <= 21:
+                    state = await get_user_state(self.chat_id)
+                    last_interaction_str = state.get("last_user_interaction_at")
+                    last_interaction = datetime.fromisoformat(last_interaction_str) if last_interaction_str else datetime.min.replace(tzinfo=ZoneInfo("Africa/Nairobi"))
+
+                    if (now - last_interaction) >= timedelta(hours=6):
+                        last_inactivity_nudge_str = ctx.get("last_inactivity_nudge_at")
+                        last_inactivity_nudge = datetime.fromisoformat(last_inactivity_nudge_str) if last_inactivity_nudge_str else datetime.min.replace(tzinfo=ZoneInfo("Africa/Nairobi"))
+
+                        if last_inactivity_nudge.date() < now.date():
+                            # Check if there are pending tasks
+                            tasks_resp = await run_in_threadpool(
+                                lambda: self.supabase.table("user_tasks")
+                                .select("id")
+                                .eq("chat_id", self.chat_id)
+                                .eq("status", "pending")
+                                .limit(1)
+                                .execute()
+                            )
+                            if tasks_resp.data:
+                                msg = "Yo Muchiri, you've been off the radar for a bit. Hope the day's going well! Just a reminder that you've still got some pending tasks when you're back in the zone."
+                                msg += await self._get_vetted_ps()
+                                await send_telegram_message(self.chat_id, msg, reminder_type="inactivity_nudge")
+                                await update_user_context(self.chat_id, last_inactivity_nudge_at=now.isoformat())
+                                print("🧐 General Inactivity Nudge sent.")
 
             except Exception as e:
                 print(f"❌ ExecutiveSyncService Error: {e}")
@@ -699,7 +724,7 @@ async def fetch_chat_history(chat_id: str) -> List[Dict[str, str]]:
             .select("role", "content")
             .eq("chat_id", chat_id)
             .order("created_at", desc=True)
-            .limit(15)
+            .limit(30)
             .execute()
         )
         return response.data[::-1]  # chronological order
@@ -726,7 +751,7 @@ async def send_telegram_message(chat_id: str, text: str, reply_to_message_id: Op
         # Proactive Nudge Guard: Check for Cool-down and Mute
         if reminder_type and chat_id == MUCHIRI_CHAT_ID:
             # Alarms, Morning Briefing, and Pomodoro Alerts bypass mute and cooldown
-            if reminder_type not in ["alarm", "alarm_escalation", "morning_briefing", "pomodoro_alert"]:
+            if reminder_type not in ["alarm", "alarm_escalation", "morning_briefing", "pomodoro_alert", "task_escalation", "suspicious_silence", "manual_nudge_request"]:
                 now = datetime.now(ZoneInfo("Africa/Nairobi"))
 
                 # 1. 1-hour Cool-down check
@@ -804,8 +829,8 @@ async def get_llm_response(prompt: str) -> str:
                 "\n\n"
                 "Rules:\n"
                 "- Never make up data or stats you don't have. If you don't know, say so plainly.\n"
-                "- Keep responses conversational and concise — no essays unless he asks.\n"
-                "- No markdown formatting like **bold** or bullet walls. Just clean natural text.\n"
+                "- Keep responses conversational and natural. Match his energy.\n"
+                "- Feel free to use markdown (like bold or lists) to make information scannable when appropriate.\n"
                 "- Don't start every message the same way. Vary your openers.\n"
                 "- If he seems stressed or tired, acknowledge it like a friend would.\n"
                 "- If he just added a task without providing an effort/impact score, ask him for it.\n"
@@ -889,8 +914,8 @@ async def get_groq_response(prompt: str, history: List[Dict[str, str]]) -> str:
             "\n\n"
             "Rules:\n"
             "- Never make up data or stats you don't have. If you don't know, say so plainly.\n"
-            "- Keep responses conversational and concise — no essays unless he asks.\n"
-            "- No markdown formatting like **bold** or bullet walls. Just clean natural text.\n"
+            "- Keep responses conversational and natural. Match his energy.\n"
+            "- Feel free to use markdown (like bold or lists) to make information scannable when appropriate.\n"
             "- Don't start every message the same way. Vary your openers.\n"
             "- If he seems stressed or tired, acknowledge it like a friend would.\n"
             "- If he just added a task without providing an effort/impact score, ask him for it.\n"
@@ -1038,8 +1063,8 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
                     print(f"🛡️ Intent Guard: Inquiry detected in nudge request. Skipping automated nudge for '{text}'.")
                 else:
                     nudge_msg = await intent_classifier.get_nudge_message(chat_id)
-                    await send_telegram_message(chat_id, nudge_msg, reminder_type="manual_nudge_request")
-                    return {"status": "success", "category": "Nudge"}
+                    # Pass the nudge message as a hint to the LLM instead of returning early
+                    text = f"[Nudge Hint: {nudge_msg}] {text}"
         except Exception as e:
             print(f"Classification or specialized storage error: {e}")
             category = "Unknown"

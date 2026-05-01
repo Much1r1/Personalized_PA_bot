@@ -117,6 +117,11 @@ async def test_webhook_intent_guard(mock_table, mock_send, mock_llm, mock_classi
 
     # Case 2: Regular nudge request
     payload["message"]["text"] = "Nudge me"
-    await main.telegram_webhook(MockRequest(), bg_tasks)
-    nudge_calls = [call for call in mock_send.call_args_list if call.kwargs.get("reminder_type") == "manual_nudge_request"]
-    assert len(nudge_calls) == 1
+    # We need to mock get_nudge_message since it's called inside webhook now
+    with patch("main.intent_classifier.get_nudge_message", new_callable=AsyncMock) as mock_get_nudge:
+        mock_get_nudge.return_value = "Nudge context"
+        await main.telegram_webhook(MockRequest(), bg_tasks)
+
+    # In the new logic, manual_nudge_request is NOT sent directly via send_telegram_message
+    # but passed as a hint to the LLM.
+    assert "[Nudge Hint: Nudge context]" in mock_llm.call_args[0][0]
