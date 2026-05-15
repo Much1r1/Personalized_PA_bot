@@ -3,6 +3,7 @@ import base64
 import json
 from typing import Optional, List, Dict, Any, Callable
 from contextvars import ContextVar
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
 from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel
@@ -12,6 +13,9 @@ from supabase import create_client, Client
 import httpx
 import asyncio
 import re
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.interval import IntervalTrigger
+from apscheduler.triggers.cron import CronTrigger
 from dotenv import load_dotenv
 from pomodoro_service import PomodoroService
 from intent_classifier import IntentClassifier
@@ -35,7 +39,6 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 MUCHIRI_CHAT_ID = os.getenv("MUCHIRI_CHAT_ID")
 
 # Initialize Clients
-app = FastAPI(title="M-bot")
 groq_client = AsyncGroq(api_key=GROQ_API_KEY)
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 pomodoro_service = PomodoroService(supabase)
@@ -322,189 +325,189 @@ class NudgeEngine:
     def __init__(self, supabase_client: Client):
         self.supabase = supabase_client
 
-    async def run(self):
+    async def check_alerts(self):
         """
-        Background task that queries user_tasks and user_alarms every minute.
+        Job that queries user_tasks and user_alarms.
         Handles proactive messaging and the Escalation Policy.
         """
-        while True:
+        try:
+            now = datetime.now(ZoneInfo("Africa/Nairobi"))
+            escalation_time = now - timedelta(minutes=5)
+
+            # 1. Handle Alarms (Always processed regardless of Silent Mode)
             try:
-                now = datetime.now(ZoneInfo("Africa/Nairobi"))
-                escalation_time = now - timedelta(minutes=5)
-
-                # 1. Handle Alarms (Always processed regardless of Silent Mode)
-                try:
-                    alarms_resp = await run_in_threadpool(
+                alarms_resp = await run_in_threadpool(
+                    lambda: self.supabase.table("user_alarms")
+                    .select("*")
+                    .eq("status", "pending")
+                    .lte("alarm_time", now.isoformat())
+                    .execute()
+                )
+                for alarm in alarms_resp.data:
+                    chat_id = alarm["chat_id"]
+                    await send_telegram_message(chat_id, f"🚨 ALARM: {alarm['message']}", reminder_type="alarm")
+                    await run_in_threadpool(
                         lambda: self.supabase.table("user_alarms")
-                        .select("*")
-                        .eq("status", "pending")
-                        .lte("alarm_time", now.isoformat())
+                        .update({"status": "triggered", "triggered_at": now.isoformat()})
+                        .eq("id", alarm["id"])
                         .execute()
                     )
-                    for alarm in alarms_resp.data:
-                        chat_id = alarm["chat_id"]
-                        await send_telegram_message(chat_id, f"🚨 ALARM: {alarm['message']}", reminder_type="alarm")
-                        await run_in_threadpool(
-                            lambda: self.supabase.table("user_alarms")
-                            .update({"status": "triggered", "triggered_at": now.isoformat()})
-                            .eq("id", alarm["id"])
-                            .execute()
-                        )
-                except Exception as e:
-                    print(f"Nudge Engine Alarms Error: {e}")
-
-                # 2. Handle Escalation Policy (5-minute rule)
-                try:
-                    escalation_resp = await run_in_threadpool(
-                        lambda: self.supabase.table("user_alarms")
-                        .select("*")
-                        .eq("status", "triggered")
-                        .lte("triggered_at", escalation_time.isoformat())
-                        .is_("acknowledged_at", "null")
-                        .execute()
-                    )
-                    for alarm in escalation_resp.data:
-                        chat_id = alarm["chat_id"]
-                        await send_telegram_message(
-                            chat_id,
-                            f"⚠️ ESCALATION: You haven't acknowledged your alarm: {alarm['message']}. "
-                            "Your 'Probability of Outage' is increasing. Action required.",
-                            reminder_type="alarm_escalation"
-                        )
-                        await run_in_threadpool(
-                            lambda: self.supabase.table("user_alarms")
-                            .update({"triggered_at": now.isoformat()})
-                            .eq("id", alarm["id"])
-                            .execute()
-                        )
-                except Exception as e:
-                    print(f"Nudge Engine Alarm Escalation Error: {e}")
-
-                # --- PROACTIVE NUDGES BELOW (Subject to Silent Mode) ---
-
-                # 3. Handle Tasks due for nudge
-                try:
-                    tasks_resp = await run_in_threadpool(
-                        lambda: self.supabase.table("user_tasks")
-                        .select("*")
-                        .eq("status", "pending")
-                        .lte("due_date", now.isoformat())
-                        .is_("triggered_at", "null")
-                        .is_("acknowledged_at", "null")
-                        .execute()
-                    )
-                    vetted_ps_cache = {}
-                    for task in tasks_resp.data:
-                        chat_id = task["chat_id"]
-                        ctx = await get_user_context(chat_id)
-                        state = await get_user_state(chat_id)
-
-                        # Suppression Logic
-                        last_interaction_str = state.get("last_user_interaction_at")
-                        if last_interaction_str:
-                            last_interaction = datetime.fromisoformat(last_interaction_str)
-                            if (now - last_interaction) < timedelta(minutes=10):
-                                print(f"🤫 Nag Kill-Switch: Recent interaction ({now - last_interaction}). Skipping task nudge.")
-                                continue
-                            if (now - last_interaction) < timedelta(hours=3):
-                                # 3-hour suppression for non-escalation nudges
-                                # Check if it's a "Deep Work" reminder context
-                                if ctx.get("current_block_type") in ["calendar_focus", "pomodoro"]:
-                                    print(f"🤫 Suppression: Under 3h since interaction. Skipping Deep Work reminder.")
-                                    continue
-
-                        if state.get("pomodoro_active"):
-                            print(f"🤫 Pomodoro Lock active. Skipping non-essential nudge.")
-                            continue
-
-                        if ctx.get("current_block_type"):
-                            print(f"🤫 Silent Mode active ({ctx['current_block_type']}). Skipping task nudge.")
-                            continue
-
-                        if chat_id not in vetted_ps_cache:
-                            vetted_ps_cache[chat_id] = await executive_sync_service._get_vetted_ps(chat_id)
-
-                        await send_telegram_message(chat_id, f"🕒 TASK DUE: {task['title']}{vetted_ps_cache[chat_id]}", reminder_type="task_nudge")
-                        await run_in_threadpool(
-                            lambda: self.supabase.table("user_tasks")
-                            .update({"triggered_at": now.isoformat()})
-                            .eq("id", task["id"])
-                            .execute()
-                        )
-                except Exception as e:
-                    print(f"Nudge Engine Tasks Error: {e}")
-
-                # Tasks escalation
-                try:
-                    task_escalation_resp = await run_in_threadpool(
-                        lambda: self.supabase.table("user_tasks")
-                        .select("*")
-                        .eq("status", "pending")
-                        .lte("triggered_at", escalation_time.isoformat())
-                        .is_("acknowledged_at", "null")
-                        .execute()
-                    )
-                    for task in task_escalation_resp.data:
-                        chat_id = task["chat_id"]
-                        ctx = await get_user_context(chat_id)
-                        state = await get_user_state(chat_id)
-
-                        # Escalations bypass the 10m/3h suppression but respect Pomodoro Lock if not an alarm
-                        if state.get("pomodoro_active"):
-                            print(f"🤫 Pomodoro Lock active. Skipping task escalation.")
-                            continue
-
-                        if ctx.get("current_block_type"):
-                            print(f"🤫 Silent Mode active ({ctx['current_block_type']}). Skipping task escalation.")
-                            continue
-
-                        await send_telegram_message(
-                            chat_id,
-                            f"⚠️ ESCALATION: Task '{task['title']}' is still pending! "
-                            "This is impacting your 'Probability of Outage'. Bro, get it done.",
-                            reminder_type="task_escalation"
-                        )
-                        await run_in_threadpool(
-                            lambda: self.supabase.table("user_tasks")
-                            .update({"triggered_at": now.isoformat()})
-                            .eq("id", task["id"])
-                            .execute()
-                        )
-                except Exception as e:
-                    print(f"Nudge Engine Task Escalation Error: {e}")
-
-                # 4. Handle Pomodoro sessions (System alerts, not subject to Silent Mode)
-                try:
-                    pomodoro_resp = await run_in_threadpool(
-                        lambda: self.supabase.table("pomodoro_sessions")
-                        .select("*")
-                        .eq("status", "active")
-                        .lte("end_time", now.isoformat())
-                        .execute()
-                    )
-                    for session in pomodoro_resp.data:
-                        # Use chat_id if available, fallback to user_id
-                        target_chat_id = session.get("chat_id") or session["user_id"]
-                        session_type = session["type"]
-                        msg = "🔔 Time's up! Pomodoro session completed. Take a break, G." if session_type == "work" else "🔔 Break's over! Let's get back to it."
-                        await send_telegram_message(target_chat_id, msg, reminder_type="pomodoro_alert")
-                        await update_user_state(target_chat_id, pomodoro_active=False)
-                        await run_in_threadpool(
-                            lambda: self.supabase.table("pomodoro_sessions")
-                            .update({"status": "completed"})
-                            .eq("id", session["id"])
-                            .execute()
-                        )
-                except Exception as e:
-                    print(f"Nudge Engine Pomodoro Error: {e}")
-
             except Exception as e:
-                print(f"Nudge Engine Error: {e}")
+                print(f"Nudge Engine Alarms Error: {e}")
 
-            await asyncio.sleep(60)
+            # 2. Handle Escalation Policy (5-minute rule)
+            try:
+                escalation_resp = await run_in_threadpool(
+                    lambda: self.supabase.table("user_alarms")
+                    .select("*")
+                    .eq("status", "triggered")
+                    .lte("triggered_at", escalation_time.isoformat())
+                    .is_("acknowledged_at", "null")
+                    .execute()
+                )
+                for alarm in escalation_resp.data:
+                    chat_id = alarm["chat_id"]
+                    await send_telegram_message(
+                        chat_id,
+                        f"⚠️ ESCALATION: You haven't acknowledged your alarm: {alarm['message']}. "
+                        "Your 'Probability of Outage' is increasing. Action required.",
+                        reminder_type="alarm_escalation"
+                    )
+                    await run_in_threadpool(
+                        lambda: self.supabase.table("user_alarms")
+                        .update({"triggered_at": now.isoformat()})
+                        .eq("id", alarm["id"])
+                        .execute()
+                    )
+            except Exception as e:
+                print(f"Nudge Engine Alarm Escalation Error: {e}")
+
+            # --- PROACTIVE NUDGES BELOW (Subject to Silent Mode) ---
+
+            # 3. Handle Tasks due for nudge
+            try:
+                tasks_resp = await run_in_threadpool(
+                    lambda: self.supabase.table("user_tasks")
+                    .select("*")
+                    .eq("status", "pending")
+                    .lte("due_date", now.isoformat())
+                    .is_("triggered_at", "null")
+                    .is_("acknowledged_at", "null")
+                    .execute()
+                )
+                vetted_ps_cache = {}
+                for task in tasks_resp.data:
+                    chat_id = task["chat_id"]
+                    ctx = await get_user_context(chat_id)
+                    state = await get_user_state(chat_id)
+
+                    # Suppression Logic
+                    last_interaction_str = state.get("last_user_interaction_at")
+                    if last_interaction_str:
+                        last_interaction = datetime.fromisoformat(last_interaction_str)
+                        if (now - last_interaction) < timedelta(minutes=10):
+                            print(f"🤫 Nag Kill-Switch: Recent interaction ({now - last_interaction}). Skipping task nudge.")
+                            continue
+                        if (now - last_interaction) < timedelta(hours=3):
+                            # 3-hour suppression for non-escalation nudges
+                            # Check if it's a "Deep Work" reminder context
+                            if ctx.get("current_block_type") in ["calendar_focus", "pomodoro"]:
+                                print(f"🤫 Suppression: Under 3h since interaction. Skipping Deep Work reminder.")
+                                continue
+
+                    if state.get("pomodoro_active"):
+                        print(f"🤫 Pomodoro Lock active. Skipping non-essential nudge.")
+                        continue
+
+                    if ctx.get("current_block_type"):
+                        print(f"🤫 Silent Mode active ({ctx['current_block_type']}). Skipping task nudge.")
+                        continue
+
+                    if chat_id not in vetted_ps_cache:
+                        vetted_ps_cache[chat_id] = await executive_sync_service._get_vetted_ps(chat_id)
+
+                    await send_telegram_message(chat_id, f"🕒 TASK DUE: {task['title']}{vetted_ps_cache[chat_id]}", reminder_type="task_nudge")
+                    await run_in_threadpool(
+                        lambda: self.supabase.table("user_tasks")
+                        .update({"triggered_at": now.isoformat()})
+                        .eq("id", task["id"])
+                        .execute()
+                    )
+            except Exception as e:
+                print(f"Nudge Engine Tasks Error: {e}")
+
+            # Tasks escalation
+            try:
+                task_escalation_resp = await run_in_threadpool(
+                    lambda: self.supabase.table("user_tasks")
+                    .select("*")
+                    .eq("status", "pending")
+                    .lte("triggered_at", escalation_time.isoformat())
+                    .is_("acknowledged_at", "null")
+                    .execute()
+                )
+                for task in task_escalation_resp.data:
+                    chat_id = task["chat_id"]
+                    ctx = await get_user_context(chat_id)
+                    state = await get_user_state(chat_id)
+
+                    # Escalations bypass the 10m/3h suppression but respect Pomodoro Lock if not an alarm
+                    if state.get("pomodoro_active"):
+                        print(f"🤫 Pomodoro Lock active. Skipping task escalation.")
+                        continue
+
+                    if ctx.get("current_block_type"):
+                        print(f"🤫 Silent Mode active ({ctx['current_block_type']}). Skipping task escalation.")
+                        continue
+
+                    await send_telegram_message(
+                        chat_id,
+                        f"⚠️ ESCALATION: Task '{task['title']}' is still pending! "
+                        "This is impacting your 'Probability of Outage'. Bro, get it done.",
+                        reminder_type="task_escalation"
+                    )
+                    await run_in_threadpool(
+                        lambda: self.supabase.table("user_tasks")
+                        .update({"triggered_at": now.isoformat()})
+                        .eq("id", task["id"])
+                        .execute()
+                    )
+            except Exception as e:
+                print(f"Nudge Engine Task Escalation Error: {e}")
+
+            # 4. Handle Pomodoro sessions (System alerts, not subject to Silent Mode)
+            try:
+                pomodoro_resp = await run_in_threadpool(
+                    lambda: self.supabase.table("pomodoro_sessions")
+                    .select("*")
+                    .eq("status", "active")
+                    .lte("end_time", now.isoformat())
+                    .execute()
+                )
+                for session in pomodoro_resp.data:
+                    # Use chat_id if available, fallback to user_id
+                    target_chat_id = session.get("chat_id") or session["user_id"]
+                    session_type = session["type"]
+                    msg = "🔔 Time's up! Pomodoro session completed. Take a break, G." if session_type == "work" else "🔔 Break's over! Let's get back to it."
+                    await send_telegram_message(target_chat_id, msg, reminder_type="pomodoro_alert")
+                    await update_user_state(target_chat_id, pomodoro_active=False)
+                    await run_in_threadpool(
+                        lambda: self.supabase.table("pomodoro_sessions")
+                        .update({"status": "completed"})
+                        .eq("id", session["id"])
+                        .execute()
+                    )
+            except Exception as e:
+                print(f"Nudge Engine Pomodoro Error: {e}")
+
+        except Exception as e:
+            print(f"Nudge Engine Error: {e}")
 
 
 nudge_engine_service = NudgeEngine(supabase)
+
+# Global scheduler
+scheduler = AsyncIOScheduler()
 
 
 class ExecutiveSyncService:
@@ -528,161 +531,198 @@ class ExecutiveSyncService:
             print(f"Error fetching Vetted count: {e}")
         return ""
 
-    async def run(self):
+    async def sync_executive_state(self):
         """
-        Main loop for the Executive PA logic. Runs every 1 minute.
+        Job for the Executive PA logic.
         """
         if not self.chat_id:
-            print("⚠️ ExecutiveSyncService: MUCHIRI_CHAT_ID not set. Skipping.")
             return
 
-        while True:
-            try:
-                now = datetime.now(ZoneInfo("Africa/Nairobi"))
-                ctx = await get_user_context(self.chat_id)
+        try:
+            now = datetime.now(ZoneInfo("Africa/Nairobi"))
+            ctx = await get_user_context(self.chat_id)
 
-                # 1. The 8 AM Briefing
-                is_briefing_time = (now.hour == 8 and now.minute == 0)
-                is_retry_time = (now.hour == 8 and now.minute == 15)
+            # 1. The 8 AM Briefing
+            is_briefing_time = (now.hour == 8 and now.minute == 0)
+            is_retry_time = (now.hour == 8 and now.minute == 15)
 
-                if is_briefing_time or is_retry_time:
-                    last_briefing = ctx.get("last_briefing_at")
-                    is_sent_today = False
-                    if last_briefing:
-                        lb_dt = datetime.fromisoformat(last_briefing)
-                        if lb_dt.date() == now.date():
-                            is_sent_today = True
+            if is_briefing_time or is_retry_time:
+                last_briefing = ctx.get("last_briefing_at")
+                is_sent_today = False
+                if last_briefing:
+                    lb_dt = datetime.fromisoformat(last_briefing)
+                    if lb_dt.date() == now.date():
+                        is_sent_today = True
 
-                    if not is_sent_today:
-                        briefing_content = await get_scannable_briefing(self.chat_id)
+                if not is_sent_today:
+                    briefing_content = await get_scannable_briefing(self.chat_id)
 
-                        msg = f"Morning Muchiri. Here's your scannable list for today:\n\n{briefing_content}"
+                    msg = f"Morning Muchiri. Here's your scannable list for today:\n\n{briefing_content}"
 
-                        # Use a dedicated reminder type for duplicate prevention if needed,
-                        # though briefing has its own state tracking.
-                        await send_telegram_message(self.chat_id, msg, reminder_type="morning_briefing")
-                        await update_user_context(self.chat_id, last_briefing_at=now.isoformat())
-                        print(f"✅ 8 AM Briefing sent (Time: {now.strftime('%H:%M')}).")
+                    # Use a dedicated reminder type for duplicate prevention if needed,
+                    # though briefing has its own state tracking.
+                    await send_telegram_message(self.chat_id, msg, reminder_type="morning_briefing")
+                    await update_user_context(self.chat_id, last_briefing_at=now.isoformat())
+                    print(f"✅ 8 AM Briefing sent (Time: {now.strftime('%H:%M')}).")
 
-                # 2. Elastic Deep Work Sync
-                active_pomodoro = await self.pomodoro_service.get_active_session(self.chat_id)
+            # 2. Elastic Deep Work Sync
+            active_pomodoro = await self.pomodoro_service.get_active_session(self.chat_id)
 
-                # Fetch calendar for current/upcoming events
-                creds = await run_in_threadpool(get_google_creds)
-                current_block_id = None
-                current_block_type = None
+            # Fetch calendar for current/upcoming events
+            creds = await run_in_threadpool(get_google_creds)
+            current_block_id = None
+            current_block_type = None
 
-                if active_pomodoro:
-                    current_block_id = active_pomodoro["id"]
-                    current_block_type = "pomodoro"
-                elif creds:
-                    # Use Google Calendar API directly to see if we are currently in a block
-                    service = build('calendar', 'v3', credentials=creds)
-                    now_iso = now.isoformat()
-                    events_result = await run_in_threadpool(
-                        lambda: service.events().list(
-                            calendarId='primary',
-                            timeMin=now_iso,
-                            maxResults=5,
-                            singleEvents=True,
-                            orderBy='startTime'
-                        ).execute()
-                    )
-                    events = events_result.get('items', [])
-                    for event in events:
-                        start_str = event['start'].get('dateTime', event['start'].get('date'))
-                        end_str = event['end'].get('dateTime', event['end'].get('date'))
-                        start_dt = datetime.fromisoformat(start_str.replace('Z', '+00:00')).astimezone(ZoneInfo("Africa/Nairobi"))
-                        end_dt = datetime.fromisoformat(end_str.replace('Z', '+00:00')).astimezone(ZoneInfo("Africa/Nairobi"))
+            if active_pomodoro:
+                current_block_id = active_pomodoro["id"]
+                current_block_type = "pomodoro"
+            elif creds:
+                # Use Google Calendar API directly to see if we are currently in a block
+                service = build('calendar', 'v3', credentials=creds)
+                now_iso = now.isoformat()
+                events_result = await run_in_threadpool(
+                    lambda: service.events().list(
+                        calendarId='primary',
+                        timeMin=now_iso,
+                        maxResults=5,
+                        singleEvents=True,
+                        orderBy='startTime'
+                    ).execute()
+                )
+                events = events_result.get('items', [])
+                for event in events:
+                    start_str = event['start'].get('dateTime', event['start'].get('date'))
+                    end_str = event['end'].get('dateTime', event['end'].get('date'))
+                    start_dt = datetime.fromisoformat(start_str.replace('Z', '+00:00')).astimezone(ZoneInfo("Africa/Nairobi"))
+                    end_dt = datetime.fromisoformat(end_str.replace('Z', '+00:00')).astimezone(ZoneInfo("Africa/Nairobi"))
 
-                        if start_dt <= now <= end_dt:
-                            summary = event.get('summary', '').lower()
-                            if "deep work" in summary or "ai engineering" in summary:
-                                current_block_id = event['id']
-                                current_block_type = "calendar_focus"
-                                break
+                    if start_dt <= now <= end_dt:
+                        summary = event.get('summary', '').lower()
+                        if "deep work" in summary or "ai engineering" in summary:
+                            current_block_id = event['id']
+                            current_block_type = "calendar_focus"
+                            break
 
-                # Update context state
-                previous_block_type = ctx.get("current_block_type")
-                previous_block_id = ctx.get("current_block_id")
+            # Update context state
+            previous_block_type = ctx.get("current_block_type")
+            previous_block_id = ctx.get("current_block_id")
 
-                if current_block_type != previous_block_type or current_block_id != previous_block_id:
-                    await update_user_context(
-                        self.chat_id,
-                        current_block_type=current_block_type,
-                        current_block_id=current_block_id
-                    )
-                    print(f"🔄 Block state updated: {current_block_type} ({current_block_id})")
+            if current_block_type != previous_block_type or current_block_id != previous_block_id:
+                await update_user_context(
+                    self.chat_id,
+                    current_block_type=current_block_type,
+                    current_block_id=current_block_id
+                )
+                print(f"🔄 Block state updated: {current_block_type} ({current_block_id})")
 
-                # 3. The 'Suspicious Silence' Nudge
-                if not current_block_type:
-                    # Check if a block ended recently (more than 15 mins ago)
-                    # We use updated_at to see when current_block_type became None
-                    updated_at_str = ctx.get("updated_at")
-                    if updated_at_str:
-                        updated_at = datetime.fromisoformat(updated_at_str)
-                        # If block ended more than 15 mins ago
-                        if (now - updated_at) >= timedelta(minutes=15):
-                            # Check if we already nudged for this silence
-                            last_silence_nudge_str = ctx.get("last_suspicious_silence_at")
-                            last_silence_nudge = datetime.fromisoformat(last_silence_nudge_str) if last_silence_nudge_str else datetime.min.replace(tzinfo=ZoneInfo("Africa/Nairobi"))
+            # 3. The 'Suspicious Silence' Nudge
+            if not current_block_type:
+                # Check if a block ended recently (more than 15 mins ago)
+                # We use updated_at to see when current_block_type became None
+                updated_at_str = ctx.get("updated_at")
+                if updated_at_str:
+                    updated_at = datetime.fromisoformat(updated_at_str)
+                    # If block ended more than 15 mins ago
+                    if (now - updated_at) >= timedelta(minutes=15):
+                        # Check if we already nudged for this silence
+                        last_silence_nudge_str = ctx.get("last_suspicious_silence_at")
+                        last_silence_nudge = datetime.fromisoformat(last_silence_nudge_str) if last_silence_nudge_str else datetime.min.replace(tzinfo=ZoneInfo("Africa/Nairobi"))
 
-                            if last_silence_nudge < updated_at:
-                                # Check last interaction
-                                state = await get_user_state(self.chat_id)
-                                last_interaction_str = state.get("last_user_interaction_at")
-                                last_interaction = datetime.fromisoformat(last_interaction_str) if last_interaction_str else datetime.min.replace(tzinfo=ZoneInfo("Africa/Nairobi"))
+                        if last_silence_nudge < updated_at:
+                            # Check last interaction
+                            state = await get_user_state(self.chat_id)
+                            last_interaction_str = state.get("last_user_interaction_at")
+                            last_interaction = datetime.fromisoformat(last_interaction_str) if last_interaction_str else datetime.min.replace(tzinfo=ZoneInfo("Africa/Nairobi"))
 
-                                if last_interaction < updated_at:
-                                    # 3-hour suppression check for Suspicious Silence
-                                    if (now - last_interaction) >= timedelta(hours=3):
-                                        # User hasn't messaged since block ended and it's been > 3 hours
-                                        msg = f"Block ended at {updated_at.strftime('%H:%M')}. How did it go? Send an update to stay on track."
-                                        msg += await self._get_vetted_ps()
-                                        await send_telegram_message(self.chat_id, msg, reminder_type="suspicious_silence")
-                                        await update_user_context(self.chat_id, last_suspicious_silence_at=now.isoformat())
-                                        print("🧐 Suspicious Silence Nudge sent.")
+                            if last_interaction < updated_at:
+                                # 3-hour suppression check for Suspicious Silence
+                                if (now - last_interaction) >= timedelta(hours=3):
+                                    # User hasn't messaged since block ended and it's been > 3 hours
+                                    msg = f"Block ended at {updated_at.strftime('%H:%M')}. How did it go? Send an update to stay on track."
+                                    msg += await self._get_vetted_ps()
+                                    await send_telegram_message(self.chat_id, msg, reminder_type="suspicious_silence")
+                                    await update_user_context(self.chat_id, last_suspicious_silence_at=now.isoformat())
+                                    print("🧐 Suspicious Silence Nudge sent.")
 
-                # 4. General Inactivity Nudge (MIA for 6+ hours)
-                if 9 <= now.hour <= 21:
-                    state = await get_user_state(self.chat_id)
-                    last_interaction_str = state.get("last_user_interaction_at")
-                    last_interaction = datetime.fromisoformat(last_interaction_str) if last_interaction_str else datetime.min.replace(tzinfo=ZoneInfo("Africa/Nairobi"))
+            # 4. General Inactivity Nudge (MIA for 6+ hours)
+            if 9 <= now.hour <= 21:
+                state = await get_user_state(self.chat_id)
+                last_interaction_str = state.get("last_user_interaction_at")
+                last_interaction = datetime.fromisoformat(last_interaction_str) if last_interaction_str else datetime.min.replace(tzinfo=ZoneInfo("Africa/Nairobi"))
 
-                    if (now - last_interaction) >= timedelta(hours=6):
-                        last_inactivity_nudge_str = ctx.get("last_inactivity_nudge_at")
-                        last_inactivity_nudge = datetime.fromisoformat(last_inactivity_nudge_str) if last_inactivity_nudge_str else datetime.min.replace(tzinfo=ZoneInfo("Africa/Nairobi"))
+                if (now - last_interaction) >= timedelta(hours=6):
+                    last_inactivity_nudge_str = ctx.get("last_inactivity_nudge_at")
+                    last_inactivity_nudge = datetime.fromisoformat(last_inactivity_nudge_str) if last_inactivity_nudge_str else datetime.min.replace(tzinfo=ZoneInfo("Africa/Nairobi"))
 
-                        if last_inactivity_nudge.date() < now.date():
-                            # Check if there are pending tasks
-                            tasks_resp = await run_in_threadpool(
-                                lambda: self.supabase.table("user_tasks")
-                                .select("id")
-                                .eq("chat_id", self.chat_id)
-                                .eq("status", "pending")
-                                .limit(1)
-                                .execute()
-                            )
-                            if tasks_resp.data:
-                                msg = "Yo Muchiri, you've been off the radar for a bit. Hope the day's going well! Just a reminder that you've still got some pending tasks when you're back in the zone."
-                                msg += await self._get_vetted_ps()
-                                await send_telegram_message(self.chat_id, msg, reminder_type="inactivity_nudge")
-                                await update_user_context(self.chat_id, last_inactivity_nudge_at=now.isoformat())
-                                print("🧐 General Inactivity Nudge sent.")
+                    if last_inactivity_nudge.date() < now.date():
+                        # Check if there are pending tasks
+                        tasks_resp = await run_in_threadpool(
+                            lambda: self.supabase.table("user_tasks")
+                            .select("id")
+                            .eq("chat_id", self.chat_id)
+                            .eq("status", "pending")
+                            .limit(1)
+                            .execute()
+                        )
+                        if tasks_resp.data:
+                            msg = "Yo Muchiri, you've been off the radar for a bit. Hope the day's going well! Just a reminder that you've still got some pending tasks when you're back in the zone."
+                            msg += await self._get_vetted_ps()
+                            await send_telegram_message(self.chat_id, msg, reminder_type="inactivity_nudge")
+                            await update_user_context(self.chat_id, last_inactivity_nudge_at=now.isoformat())
+                            print("🧐 General Inactivity Nudge sent.")
 
-            except Exception as e:
-                print(f"❌ ExecutiveSyncService Error: {e}")
-
-            await asyncio.sleep(60)
+        except Exception as e:
+            print(f"❌ ExecutiveSyncService Error: {e}")
 
 
 executive_sync_service = ExecutiveSyncService(supabase, pomodoro_service)
 
 
-@app.on_event("startup")
-async def startup_event():
-    asyncio.create_task(nudge_engine_service.run())
-    asyncio.create_task(executive_sync_service.run())
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Register jobs
+    scheduler.add_job(
+        nudge_engine_service.check_alerts,
+        trigger=IntervalTrigger(minutes=1),
+        id="nudge_engine_job",
+        replace_existing=True
+    )
+    scheduler.add_job(
+        executive_sync_service.sync_executive_state,
+        trigger=IntervalTrigger(minutes=1),
+        id="executive_sync_job",
+        replace_existing=True
+    )
+    scheduler.add_job(
+        evaluate_project_velocity,
+        trigger=IntervalTrigger(hours=4),
+        id="velocity_check_job",
+        replace_existing=True
+    )
+    scheduler.add_job(
+        evaluate_habit_velocity,
+        trigger=IntervalTrigger(hours=4),
+        id="habit_velocity_job",
+        replace_existing=True
+    )
+    scheduler.add_job(
+        morning_routine_check,
+        trigger=CronTrigger(hour=8, minute=0, timezone="Africa/Nairobi"),
+        id="morning_routine_job",
+        replace_existing=True
+    )
+
+    scheduler.start()
+    print("✅ AsyncIOScheduler started.")
+
+    yield
+
+    scheduler.shutdown()
+    print("🛑 AsyncIOScheduler shut down.")
+
+
+app = FastAPI(title="M-bot", lifespan=lifespan)
+# Global clients
 
 
 
@@ -794,6 +834,108 @@ async def send_telegram_message(chat_id: str, text: str, reply_to_message_id: Op
                 last_nudge_sent_at = datetime.now(ZoneInfo("Africa/Nairobi"))
     except Exception as e:
         print(f"Error sending Telegram message: {e}")
+
+
+async def generate_personalized_nudge(project_name: str, status: str) -> str:
+    """Generate a personalized nudge using Gemini."""
+    try:
+        model = genai.GenerativeModel("gemini-1.5-flash")
+        prompt = f"Given this project ({project_name}) status: {status} and the 25th deadline, write a concise, sharp 1-sentence reminder for a high-performance engineer."
+        response = await model.generate_content_async(prompt)
+        return response.text.strip()
+    except Exception as e:
+        print(f"Error generating personalized nudge: {e}")
+        return f"Yo Muchiri, don't forget to push updates for {project_name}. Time's ticking!"
+
+
+async def evaluate_project_velocity():
+    """
+    Checks active projects and triggers nudges if velocity is low.
+    Runs every 4 hours via APScheduler.
+    """
+    try:
+        now = datetime.now(ZoneInfo("Africa/Nairobi"))
+        twelve_hours_ago = now - timedelta(hours=12)
+
+        res = await run_in_threadpool(
+            lambda: supabase.table("goals").select("*").eq("status", "active").execute()
+        )
+        projects = res.data
+
+        for project in projects:
+            project_id = project["id"]
+            project_name = project["name"]
+            priority = project.get("priority", 1)
+
+            log_res = await run_in_threadpool(
+                lambda: supabase.table("activity_logs")
+                .select("created_at")
+                .eq("project_id", project_id)
+                .order("created_at", desc=True)
+                .limit(1)
+                .execute()
+            )
+
+            last_update = None
+            if log_res.data:
+                last_update = datetime.fromisoformat(log_res.data[0]["created_at"])
+
+            is_stalled = False
+            if not last_update or last_update < twelve_hours_ago:
+                if priority >= 7:
+                    is_stalled = True
+                elif "Portfolio" in project_name and now.day <= 25:
+                    is_stalled = True
+
+            if is_stalled:
+                status_desc = f"No updates in over 12 hours."
+                if not last_update:
+                    status_desc = "No activity logs found."
+
+                nudge = await generate_personalized_nudge(project_name, status_desc)
+                await send_telegram_message(MUCHIRI_CHAT_ID, nudge, reminder_type="velocity_nudge")
+                print(f"🚀 Velocity nudge sent for project: {project_name}")
+
+    except Exception as e:
+        print(f"Error in evaluate_project_velocity: {e}")
+
+
+async def evaluate_habit_velocity():
+    """
+    Checks habit streaks and triggers alerts for breaks.
+    Specifically handles the Dopamine Discipline pillar.
+    """
+    try:
+        now = datetime.now(ZoneInfo("Africa/Nairobi"))
+        # Habits are checked every 4 hours, but we mainly care if they weren't completed yesterday/today
+        # For simplicity, we check if streak was recently reset or if broken
+        res = await run_in_threadpool(
+            lambda: supabase.table("habits").select("*").execute()
+        )
+        habits = res.data
+
+        for habit in habits:
+            name = habit["name"]
+            streak = habit.get("streak", 0)
+            last_completed = habit.get("last_completed_at")
+
+            if name == "dopamine_integrity" and streak == 0 and last_completed:
+                last_dt = datetime.fromisoformat(last_completed)
+                if (now - last_dt) > timedelta(days=1):
+                    # Streak broken logic (simplified)
+                    msg = "🚨 Systems Failure Alert: Chief, we just hit a bottleneck in the reward center. Resetting counter. Let's get back to the GNN research to stabilize the dopamine loop."
+                    await send_telegram_message(MUCHIRI_CHAT_ID, msg, reminder_type="habit_alert")
+                    print("⚠️ Dopamine Discipline alert sent.")
+
+    except Exception as e:
+        print(f"Error in evaluate_habit_velocity: {e}")
+
+
+async def morning_routine_check():
+    """Daily 8 AM routine check."""
+    msg = "Morning Routine Check: Skincare and Scent. Look like the Engineer you're building."
+    await send_telegram_message(MUCHIRI_CHAT_ID, msg, reminder_type="morning_check")
+    print("🌅 Morning routine check sent.")
 
 
 async def get_llm_response(prompt: str) -> str:
@@ -1042,6 +1184,16 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
                 await update_user_state(chat_id, is_muted=True, muted_until=muted_until)
                 await send_telegram_message(chat_id, "🔇 Global Mute active. I'll stay quiet for the next 8 hours, chief. Only alarms will get through.")
                 return {"status": "success", "command": "mute"}
+            elif text.startswith("/research"):
+                topic = text.replace("/research", "").strip()
+                if topic:
+                    await run_in_threadpool(
+                        lambda: supabase.table("knowledge_graph").insert({"topic": topic}).execute()
+                    )
+                    await send_telegram_message(chat_id, "Node added. Your intellectual latent space is expanding.")
+                else:
+                    await send_telegram_message(chat_id, "Chief, what topic are we expanding into? Usage: /research [topic]")
+                return {"status": "success", "command": "research"}
 
         # 1. Classify Intent
         try:
