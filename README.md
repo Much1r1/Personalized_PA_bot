@@ -10,7 +10,15 @@ M-bot knows your schedule, tracks your health streak, logs your dev progress, an
 
 **Project Z** — Tracks your 72-90 day health and skincare streak. Tell it "I did my skincare today" and it logs it to Supabase automatically.
 
+**Chief of Staff Mode** — Proactive monitoring of your projects and habits.
+- **4 Pillars**: Physical Rigor, Aesthetic Maintenance, Dopamine Discipline, and Intellectual Expansion.
+- **Project Velocity**: M-bot pings you if high-priority projects (like the Portfolio) haven't been updated in 12 hours.
+- **Habit Integrity**: 'Systems Failure' alerts if your Dopamine Discipline streak is broken.
+- **Secretary Persona**: Daily 8 AM routine checks for skincare and scent.
+
 **Build Mode** — Captures technical notes from your QA work at VettedAI. Brain dumps, ticket notes, code decisions — all stored.
+
+**Intellect Growth Tracker** — Use `/research [topic]` to log entries into your knowledge graph. M-bot expands your latent space.
 
 **AI Roadmap** — Tracks your progress on your AI Engineering journey. Log milestones, breakthroughs, and next steps.
 
