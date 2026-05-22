@@ -13,9 +13,7 @@ from supabase import create_client, Client
 import httpx
 import asyncio
 import re
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from apscheduler.triggers.interval import IntervalTrigger
-from apscheduler.triggers.cron import CronTrigger
+from telegram_client import TelegramClient
 from dotenv import load_dotenv
 from pomodoro_service import PomodoroService
 from intent_classifier import IntentClassifier
@@ -299,6 +297,12 @@ class NudgeRequest(BaseModel):
     message: Optional[str] = "Yo Muchiri, just checking in!"
 
 
+class BrainDump(BaseModel):
+    raw_content: str
+    tags: List[str] = []
+    metadata: Dict[str, Any] = {}
+
+
 class FunctionDispatcher:
     def __init__(self):
         self.tools: Dict[str, Callable] = {}
@@ -506,8 +510,8 @@ class NudgeEngine:
 
 nudge_engine_service = NudgeEngine(supabase)
 
-# Global scheduler
-scheduler = AsyncIOScheduler()
+# Initialize Telegram Client
+telegram_client = TelegramClient(TELEGRAM_TOKEN)
 
 
 class ExecutiveSyncService:
@@ -678,47 +682,61 @@ class ExecutiveSyncService:
 executive_sync_service = ExecutiveSyncService(supabase, pomodoro_service)
 
 
+async def outbound_telemetry_loop():
+    """
+    Native non-blocking event loop for proactive outbound messages.
+    Replaces APScheduler with a lightweight asyncio.sleep polling model.
+    """
+    print("🚀 Outbound Telemetry Loop started.")
+    last_4h_check = datetime.min.replace(tzinfo=ZoneInfo("Africa/Nairobi"))
+    last_8am_check_day = None
+
+    while True:
+        try:
+            now = datetime.now(ZoneInfo("Africa/Nairobi"))
+
+            # 1. 1-Minute Polling Tasks
+            await nudge_engine_service.check_alerts()
+            await executive_sync_service.sync_executive_state()
+
+            # 2. 4-Hour Polling Tasks
+            if (now - last_4h_check).total_seconds() >= 14400:  # 4 hours
+                await evaluate_project_velocity()
+                await evaluate_habit_velocity()
+                last_4h_check = now
+
+            # 3. Daily 8 AM Task (Nairobi Time)
+            if now.hour == 8 and last_8am_check_day != now.date():
+                await morning_routine_check()
+                last_8am_check_day = now.date()
+
+        except asyncio.CancelledError:
+            print("🛑 Outbound Telemetry Loop stopping...")
+            break
+        except Exception as e:
+            print(f"❌ Error in Outbound Telemetry Loop: {e}")
+
+        await asyncio.sleep(60)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Register jobs
-    scheduler.add_job(
-        nudge_engine_service.check_alerts,
-        trigger=IntervalTrigger(minutes=1),
-        id="nudge_engine_job",
-        replace_existing=True
-    )
-    scheduler.add_job(
-        executive_sync_service.sync_executive_state,
-        trigger=IntervalTrigger(minutes=1),
-        id="executive_sync_job",
-        replace_existing=True
-    )
-    scheduler.add_job(
-        evaluate_project_velocity,
-        trigger=IntervalTrigger(hours=4),
-        id="velocity_check_job",
-        replace_existing=True
-    )
-    scheduler.add_job(
-        evaluate_habit_velocity,
-        trigger=IntervalTrigger(hours=4),
-        id="habit_velocity_job",
-        replace_existing=True
-    )
-    scheduler.add_job(
-        morning_routine_check,
-        trigger=CronTrigger(hour=8, minute=0, timezone="Africa/Nairobi"),
-        id="morning_routine_job",
-        replace_existing=True
-    )
+    # Initialize Telegram Client
+    await telegram_client.start()
 
-    scheduler.start()
-    print("✅ AsyncIOScheduler started.")
+    # Launch non-blocking background task
+    telemetry_task = asyncio.create_task(outbound_telemetry_loop())
 
     yield
 
-    scheduler.shutdown()
-    print("🛑 AsyncIOScheduler shut down.")
+    # Clean up
+    telemetry_task.cancel()
+    try:
+        await telemetry_task
+    except asyncio.CancelledError:
+        pass
+    await telegram_client.stop()
+    print("🛑 Background tasks and Telegram client shut down.")
 
 
 app = FastAPI(title="M-bot", lifespan=lifespan)
@@ -816,15 +834,13 @@ async def send_telegram_message(chat_id: str, text: str, reply_to_message_id: Op
                 print(f"🚫 Skipping duplicate reminder: {reminder_type}")
                 return
 
-        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        payload = {"chat_id": chat_id, "text": text}
-        if reply_to_message_id:
-            payload["reply_to_message_id"] = reply_to_message_id
+        success = await telegram_client.send_message(
+            chat_id=chat_id,
+            text=text,
+            reply_to_message_id=reply_to_message_id
+        )
 
-        async with httpx.AsyncClient() as client:
-            response = await client.post(url, json=payload)
-            response.raise_for_status()
-
+        if success:
             # Log sent reminder
             if reminder_type:
                 await log_sent_reminder(chat_id, reminder_type, text)
@@ -1153,7 +1169,33 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
         background_tasks.add_task(update_user_context, chat_id, last_interaction_at=now_iso)
         background_tasks.add_task(update_user_state, chat_id, last_user_interaction_at=now_iso)
 
-        # 0. Handle Commands
+        # 0. Brain Dump Pipeline
+        if text.startswith(".") or "#" in text:
+            hashtags = re.findall(r"#(\w+)", text.lower())
+            if text.startswith(".") or hashtags:
+                try:
+                    brain_dump = BrainDump(
+                        raw_content=text,
+                        tags=hashtags,
+                        metadata={
+                            "message_id": message.get("message_id"),
+                            "chat_id": chat_id,
+                            "user_id": user_id
+                        }
+                    )
+                    await run_in_threadpool(
+                        lambda: supabase.table("brain_dumps").insert(brain_dump.model_dump()).execute()
+                    )
+                    # Use plain text confirmation to avoid markdown errors with hashtags
+                    await send_telegram_message(
+                        chat_id,
+                        f"🧠 Brain Dump captured. Tags: {', '.join(hashtags) if hashtags else 'none'}. I've got this filed, chief."
+                    )
+                    return {"status": "success", "type": "brain_dump"}
+                except Exception as e:
+                    print(f"Error in Brain Dump pipeline: {e}")
+
+        # 1. Handle Commands
         if text.startswith("/"):
             message_id = message.get("message_id")
             if text.startswith("/pomodoro"):
@@ -1195,7 +1237,7 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
                     await send_telegram_message(chat_id, "Chief, what topic are we expanding into? Usage: /research [topic]")
                 return {"status": "success", "command": "research"}
 
-        # 1. Classify Intent
+        # 2. Classify Intent
         try:
             classification = await intent_classifier.classify(text)
             category = classification.get("category")
