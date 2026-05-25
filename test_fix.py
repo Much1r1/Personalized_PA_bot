@@ -41,7 +41,7 @@ async def test_pomodoro_start_success(mock_send_msg, mock_start_session, async_c
 
     response = await async_client.post("/webhook", json=payload)
     assert response.status_code == 200
-    mock_start_session.assert_called_once_with("7345771541")
+    mock_start_session.assert_called_once_with("7345771541", chat_id="7345771541")
     mock_send_msg.assert_called_with("7345771541", "🚀 Pomodoro started! 25 minutes of deep work begins now. Focus, bro.")
 
 @pytest.mark.anyio
@@ -89,12 +89,14 @@ async def test_nudge_engine_tasks_query(mock_run_in_threadpool, mock_send_msg):
     pass # Background task testing is complex without refactoring NudgeEngine
 
 @pytest.mark.anyio
+@patch("main.get_llm_response", new_callable=AsyncMock)
 @patch("main.intent_classifier.get_nudge_message", new_callable=AsyncMock)
 @patch("main.send_telegram_message", new_callable=AsyncMock)
 @patch("main.intent_classifier.classify", new_callable=AsyncMock)
-async def test_nudge_intent_handling(mock_classify, mock_send_msg, mock_get_nudge, async_client):
+async def test_nudge_intent_handling(mock_classify, mock_send_msg, mock_get_nudge, mock_llm, async_client):
     mock_classify.return_value = {"category": "Nudge"}
     mock_get_nudge.return_value = "Get back to work, Elvis!"
+    mock_llm.return_value = "I've passed the nudge hint to the LLM."
 
     payload = {
         "message": {
@@ -106,4 +108,4 @@ async def test_nudge_intent_handling(mock_classify, mock_send_msg, mock_get_nudg
     response = await async_client.post("/webhook", json=payload)
     assert response.status_code == 200
     mock_get_nudge.assert_called_once_with("12345")
-    mock_send_msg.assert_called_with("12345", "Get back to work, Elvis!")
+    mock_send_msg.assert_called_with("12345", "I've passed the nudge hint to the LLM.")
