@@ -17,6 +17,7 @@ load_dotenv()
 # Environment Variables
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+MUCHIRI_CHAT_ID = os.getenv("MUCHIRI_CHAT_ID")
 GOOGLE_CLIENT_CONFIG = {
     "web": {
         "client_id": os.getenv("GOOGLE_CLIENT_ID"),
@@ -58,8 +59,6 @@ async def google_callback(code: str):
     flow.fetch_token(code=code)
 
     credentials = flow.credentials
-    # In a real app, store these credentials in Supabase associated with the user
-    # For boilerplate, we'll just return them
     return {
         "token": credentials.token,
         "refresh_token": credentials.refresh_token,
@@ -84,33 +83,54 @@ async def sync_google_calendar():
                 duration = time.perf_counter() - start_time
                 print(f"Supabase telemetry: Connection successful. Duration: {duration:.4f}s")
 
-                # 1. Fetch user credentials from environment variables
-                google_token_b64 = os.getenv("GOOGLE_TOKEN")
-                google_creds_b64 = os.getenv("GOOGLE_CREDENTIALS")
+                # Fetch user credentials from system_config (matching main.py logic)
+                res = await run_in_threadpool(
+                    lambda: supabase.table("system_config").select("value").eq("key", "google_token").execute()
+                )
 
-                if google_token_b64 and google_creds_b64:
-                    token_data = json.loads(base64.b64decode(google_token_b64).decode())
-                    creds_data = json.loads(base64.b64decode(google_creds_b64).decode())
+                credentials = None
+                if res.data:
+                    token_data = res.data[0]["value"]
+                    if isinstance(token_data, str):
+                        token_data = json.loads(token_data)
 
                     credentials = Credentials(
                         token=token_data.get("token"),
                         refresh_token=token_data.get("refresh_token"),
                         token_uri=token_data.get("token_uri"),
-                        client_id=creds_data.get("web", {}).get("client_id"),
-                        client_secret=creds_data.get("web", {}).get("client_secret"),
+                        client_id=token_data.get("client_id") or os.getenv("GOOGLE_CLIENT_ID"),
+                        client_secret=token_data.get("client_secret") or os.getenv("GOOGLE_CLIENT_SECRET"),
                         scopes=token_data.get("scopes")
                     )
+                else:
+                    # Fallback to env vars (legacy)
+                    google_token_b64 = os.getenv("GOOGLE_TOKEN")
+                    google_creds_b64 = os.getenv("GOOGLE_CREDENTIALS")
 
+                    if google_token_b64 and google_creds_b64:
+                        token_data = json.loads(base64.b64decode(google_token_b64).decode())
+                        creds_data = json.loads(base64.b64decode(google_creds_b64).decode())
+
+                        credentials = Credentials(
+                            token=token_data.get("token"),
+                            refresh_token=token_data.get("refresh_token"),
+                            token_uri=token_data.get("token_uri"),
+                            client_id=creds_data.get("web", {}).get("client_id"),
+                            client_secret=creds_data.get("web", {}).get("client_secret"),
+                            scopes=token_data.get("scopes")
+                        )
+
+                if credentials:
                     # 2. Initialize Google Calendar service
                     service = await run_in_threadpool(lambda: build('calendar', 'v3', credentials=credentials))
 
                     # 3. Fetch events
-                    now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+                    now_utc = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
                     events_result = await run_in_threadpool(
                         lambda: service.events().list(
                             calendarId='primary',
-                            timeMin=now,
-                            maxResults=10,
+                            timeMin=now_utc,
+                            maxResults=25,
                             singleEvents=True,
                             orderBy='startTime'
                         ).execute()
@@ -120,7 +140,6 @@ async def sync_google_calendar():
                     # 4. Upsert into 'user_schedules'
                     for event in events:
                         start = event['start'].get('dateTime', event['start'].get('date'))
-                        # Ensure ISO format for Supabase
                         if 'T' not in start:
                             start = f"{start}T00:00:00Z"
 
@@ -132,6 +151,8 @@ async def sync_google_calendar():
                             "event_id": event['id'],
                             "summary": event.get('summary', 'No Title'),
                             "description": event.get('description'),
+                            "location": event.get('location'),
+                            "chat_id": MUCHIRI_CHAT_ID,
                             "start_time": start,
                             "end_time": end,
                             "updated_at": datetime.now(timezone.utc).isoformat()
@@ -143,19 +164,12 @@ async def sync_google_calendar():
 
                     print(f"Synced {len(events)} events.")
                 else:
-                    print("Google credentials/token not found in environment. Returning 'no-data' state internally.")
+                    print("Google credentials/token not found. Returning 'no-data' state internally.")
 
             except Exception as db_err:
                 duration = time.perf_counter() - start_time
                 error_type = type(db_err).__name__
                 print(f"Supabase telemetry: Failure after {duration:.4f}s. Error: {error_type}")
-
-                # Specifically log TimeoutError or ConnectionError
-                err_msg = str(db_err).lower()
-                if "timeout" in err_msg or "connection" in err_msg:
-                    print(f"CRITICAL ERROR: Supabase {error_type} - {db_err}")
-
-                # Re-raise to be caught by the outer loop for retry
                 raise db_err
 
             await asyncio.sleep(600)  # Sync every 10 minutes
@@ -171,7 +185,6 @@ async def startup_event():
 async def health_check():
     """Verifies connection to Supabase and returns status."""
     try:
-        # Simple query to check connectivity
         await run_in_threadpool(
             lambda: supabase.table("user_schedules").select("id").limit(1).execute()
         )
