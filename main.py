@@ -13,6 +13,8 @@ from supabase import create_client, Client
 import httpx
 import asyncio
 import re
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
 from telegram_client import TelegramClient
 from dotenv import load_dotenv
 from pomodoro_service import PomodoroService
@@ -39,6 +41,7 @@ MUCHIRI_CHAT_ID = os.getenv("MUCHIRI_CHAT_ID")
 # Initialize Clients
 groq_client = AsyncGroq(api_key=GROQ_API_KEY)
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+scheduler = AsyncIOScheduler(timezone=ZoneInfo("Africa/Nairobi"))
 pomodoro_service = PomodoroService(supabase)
 intent_classifier = IntentClassifier(groq_client, supabase)
 
@@ -724,12 +727,22 @@ async def lifespan(app: FastAPI):
     # Initialize Telegram Client
     await telegram_client.start()
 
-    # Launch non-blocking background task
+    # Configure APScheduler
+    scheduler.add_job(check_upcoming_events, 'interval', seconds=60)
+    scheduler.add_job(morning_briefing_task, CronTrigger(hour=9, minute=0))
+    scheduler.add_job(evening_review_task, CronTrigger(hour=22, minute=0))
+    scheduler.add_job(cleanup_old_records, CronTrigger(hour=3, minute=0))
+
+    # Start APScheduler
+    scheduler.start()
+
+    # Launch non-blocking background task (legacy or for things not yet in APScheduler)
     telemetry_task = asyncio.create_task(outbound_telemetry_loop())
 
     yield
 
     # Clean up
+    scheduler.shutdown()
     telemetry_task.cancel()
     try:
         await telemetry_task
@@ -952,6 +965,241 @@ async def morning_routine_check():
     msg = "Morning Routine Check: Skincare and Scent. Look like the Engineer you're building."
     await send_telegram_message(MUCHIRI_CHAT_ID, msg, reminder_type="morning_check")
     print("🌅 Morning routine check sent.")
+
+
+async def generate_event_briefing(event: Dict[str, Any], window_mins: int) -> str:
+    """Generate an AI briefing for an upcoming event."""
+    chat_id = event.get("chat_id")
+    now_nairobi = datetime.now(ZoneInfo("Africa/Nairobi")).strftime("%Y-%m-%d %H:%M:%S")
+
+    start_dt = datetime.fromisoformat(event["start_time"].replace('Z', '+00:00')).astimezone(ZoneInfo("Africa/Nairobi"))
+    time_str = start_dt.strftime("%I:%M %p")
+
+    window_text = f"in {window_mins} minutes" if window_mins > 0 else "now"
+    location_text = f"\n📍 Location: {event['location']}" if event.get("location") else ""
+
+    prompt = (
+        f"Context: It's {now_nairobi}. An event is starting {window_text}.\n\n"
+        f"Event Title: {event['summary']}\n"
+        f"Start Time: {time_str}\n"
+        f"Description: {event.get('description', 'No description provided.')}\n"
+        f"{location_text}\n\n"
+        "Generate a sharp, proactive briefing in this exact format:\n"
+        "🚨 Upcoming Event: [Title]\n"
+        "Starts: [Time] ([Window Text])\n"
+        "[Location if available]\n\n"
+        "Objectives:\n"
+        "• [Extracted or inferred objective 1]\n"
+        "• [Extracted or inferred objective 2]\n\n"
+        "Suggested Focus:\n"
+        "[A concise, high-impact suggestion on what to prioritize first.]"
+    )
+
+    try:
+        # We use Gemini directly for proactive briefings to keep it sharp
+        model = genai.GenerativeModel("gemini-1.5-flash")
+        response = await model.generate_content_async(prompt)
+        return response.text.strip()
+    except Exception as e:
+        print(f"Error generating event briefing: {e}")
+        # Fallback to a basic template
+        return (
+            f"🚨 Upcoming Event: {event['summary']}\n"
+            f"Starts: {time_str} ({window_text}){location_text}\n\n"
+            "Bro, get ready for this event. Time to focus."
+        )
+
+
+async def generate_morning_briefing(chat_id: str) -> str:
+    """Generate a comprehensive morning briefing."""
+    now = datetime.now(ZoneInfo("Africa/Nairobi"))
+    start_of_day = now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+    end_of_day = now.replace(hour=23, minute=59, second=59, microsecond=999999).isoformat()
+
+    # 1. Fetch events
+    events_res = await run_in_threadpool(
+        lambda: supabase.table("user_schedules")
+        .select("*")
+        .eq("chat_id", chat_id)
+        .gte("start_time", start_of_day)
+        .lte("start_time", end_of_day)
+        .order("start_time")
+        .execute()
+    )
+
+    # 2. Fetch high-priority tasks
+    tasks_res = await run_in_threadpool(
+        lambda: supabase.table("user_tasks")
+        .select("*")
+        .eq("chat_id", chat_id)
+        .eq("status", "pending")
+        .gte("impact_score", 7)
+        .execute()
+    )
+
+    events_data = events_res.data or []
+    tasks_data = tasks_res.data or []
+
+    prompt = (
+        f"Context: It's {now.strftime('%A, %B %d, %Y')} at 9:00 AM. Time for the morning briefing.\n\n"
+        f"Today's Events: {json.dumps(events_data)}\n"
+        f"High-Priority Pending Tasks: {json.dumps(tasks_data)}\n\n"
+        "Generate a morning briefing with these sections:\n"
+        "1. Summary of today's schedule (scannable list).\n"
+        "2. Highlight 2-3 high-priority tasks to crush.\n"
+        "3. Identify free time blocks for deep work.\n\n"
+        "Tone: Senior executive assistant. Sharp, encouraging, focused on productivity."
+    )
+
+    try:
+        model = genai.GenerativeModel("gemini-1.5-flash")
+        response = await model.generate_content_async(prompt)
+        return response.text.strip()
+    except Exception as e:
+        print(f"Error generating morning briefing: {e}")
+        return "Morning! You've got a busy day ahead. Check your calendar and crush those tasks."
+
+
+async def morning_briefing_task():
+    """APScheduler task: Send daily morning briefing at 9:00 AM."""
+    if MUCHIRI_CHAT_ID:
+        briefing = await generate_morning_briefing(MUCHIRI_CHAT_ID)
+        await send_telegram_message(MUCHIRI_CHAT_ID, briefing, reminder_type="morning_briefing_proactive")
+
+
+async def generate_evening_review(chat_id: str) -> str:
+    """Generate an evening review and productivity summary."""
+    now = datetime.now(ZoneInfo("Africa/Nairobi"))
+    start_of_day = now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+    end_of_day = now.replace(hour=23, minute=59, second=59, microsecond=999999).isoformat()
+
+    # 1. Fetch today's events
+    events_res = await run_in_threadpool(
+        lambda: supabase.table("user_schedules")
+        .select("*")
+        .eq("chat_id", chat_id)
+        .gte("start_time", start_of_day)
+        .lte("start_time", end_of_day)
+        .execute()
+    )
+
+    # 2. Fetch tasks completed today or still pending
+    tasks_res = await run_in_threadpool(
+        lambda: supabase.table("user_tasks")
+        .select("*")
+        .eq("chat_id", chat_id)
+        .gte("created_at", start_of_day)
+        .execute()
+    )
+
+    prompt = (
+        f"Context: It's {now.strftime('%A, %B %d, %Y')} at 10:00 PM. Time for the evening review.\n\n"
+        f"Today's Events: {json.dumps(events_res.data)}\n"
+        f"Tasks Interaction: {json.dumps(tasks_res.data)}\n\n"
+        "Generate an evening review that:\n"
+        "1. Summarizes the day's achievements based on the schedule and tasks.\n"
+        "2. Asks Elvis what he completed from his goals today.\n"
+        "3. Provides a concise 'Productivity Summary' and a score (1-10) for the day.\n\n"
+        "Tone: Reflective, senior executive assistant, encouraging growth."
+    )
+
+    try:
+        model = genai.GenerativeModel("gemini-1.5-flash")
+        response = await model.generate_content_async(prompt)
+        return response.text.strip()
+    except Exception as e:
+        print(f"Error generating evening review: {e}")
+        return "Evening, Elvis! How was your day? Tell me what you crushed today so I can log it."
+
+
+async def evening_review_task():
+    """APScheduler task: Send daily evening review at 10:00 PM."""
+    if MUCHIRI_CHAT_ID:
+        review = await generate_evening_review(MUCHIRI_CHAT_ID)
+        await send_telegram_message(MUCHIRI_CHAT_ID, review, reminder_type="evening_review_proactive")
+
+
+async def cleanup_old_records():
+    """APScheduler task: Remove old calendar events and sent reminders for events that have passed."""
+    try:
+        now = datetime.now(ZoneInfo("Africa/Nairobi")).isoformat()
+
+        # 1. Delete old events from user_schedules
+        await run_in_threadpool(
+            lambda: supabase.table("user_schedules")
+            .delete()
+            .lt("end_time", now)
+            .execute()
+        )
+
+        # 2. Delete old event reminders from sent_reminders
+        # We keep them for 24 hours just in case, then purge.
+        one_day_ago = (datetime.now(ZoneInfo("Africa/Nairobi")) - timedelta(days=1)).isoformat()
+        await run_in_threadpool(
+            lambda: supabase.table("sent_reminders")
+            .delete()
+            .lt("event_start_time", one_day_ago)
+            .execute()
+        )
+
+        print("🧹 Cleanup of old records completed.")
+    except Exception as e:
+        print(f"Error in cleanup_old_records: {e}")
+
+
+async def check_upcoming_events():
+    try:
+        now = datetime.now(ZoneInfo("Africa/Nairobi"))
+        windows = [15, 5, 0]
+
+        for window in windows:
+            target_time = now + timedelta(minutes=window)
+            # Query events starting within a 1-minute window around the target_time
+            start_range = (target_time - timedelta(seconds=30)).isoformat()
+            end_range = (target_time + timedelta(seconds=30)).isoformat()
+
+            res = await run_in_threadpool(
+                lambda: supabase.table("user_schedules")
+                .select("*")
+                .gte("start_time", start_range)
+                .lte("start_time", end_range)
+                .execute()
+            )
+
+            for event in res.data:
+                chat_id = event.get("chat_id")
+                if not chat_id: continue
+
+                event_id = event["event_id"]
+                reminder_type = f"event_reminder_{window}m"
+
+                # Check if already sent
+                sent_res = await run_in_threadpool(
+                    lambda: supabase.table("sent_reminders")
+                    .select("id")
+                    .eq("chat_id", chat_id)
+                    .eq("event_id", event_id)
+                    .eq("reminder_type", reminder_type)
+                    .execute()
+                )
+
+                if not sent_res.data:
+                    briefing = await generate_event_briefing(event, window)
+                    await send_telegram_message(chat_id, briefing, reminder_type=reminder_type)
+                    # Log with event_id
+                    await run_in_threadpool(
+                        lambda: supabase.table("sent_reminders").insert({
+                            "chat_id": chat_id,
+                            "reminder_type": reminder_type,
+                            "content": briefing,
+                            "event_id": event_id,
+                            "event_start_time": event["start_time"],
+                            "sent_at": datetime.now(ZoneInfo("Africa/Nairobi")).isoformat()
+                        }).execute()
+                    )
+
+    except Exception as e:
+        print(f"Error in check_upcoming_events: {e}")
 
 
 async def get_llm_response(prompt: str) -> str:
