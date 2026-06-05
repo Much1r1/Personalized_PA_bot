@@ -27,9 +27,10 @@ class TelegramClient:
         text: str,
         reply_to_message_id: Optional[int] = None,
         parse_mode: Optional[str] = "Markdown"
-    ) -> bool:
+    ) -> Dict[str, Any]:
         """
         Sends an outbound message to a Telegram chat with error handling and rate-limiting.
+        Returns a dictionary: {"success": bool, "response": Optional[dict], "error": Optional[str]}
         """
         if not self.client:
             await self.start()
@@ -52,11 +53,18 @@ class TelegramClient:
                     await asyncio.sleep(retry_after)
                     return await self.send_message(chat_id, text, reply_to_message_id, parse_mode)
 
+                response_data = response.json()
                 response.raise_for_status()
-                return True
+                return {"success": True, "response": response_data, "error": None}
             except httpx.HTTPStatusError as e:
-                logger.error(f"Telegram API Error: {e.response.text}")
-                return False
+                error_msg = f"Telegram API Error: {e.response.text}"
+                logger.error(error_msg)
+                try:
+                    resp_json = e.response.json()
+                except Exception:
+                    resp_json = {"raw_error": e.response.text}
+                return {"success": False, "response": resp_json, "error": error_msg}
             except Exception as e:
-                logger.error(f"Unexpected error sending Telegram message: {e}")
-                return False
+                error_msg = f"Unexpected error sending Telegram message: {e}"
+                logger.error(error_msg)
+                return {"success": False, "response": None, "error": error_msg}

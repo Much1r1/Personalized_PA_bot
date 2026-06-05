@@ -134,6 +134,43 @@ async def log_sent_reminder(chat_id: str, reminder_type: str, content: str):
         print(f"Error logging sent reminder: {e}")
 
 
+async def log_reminder_timeline(
+    chat_id: str,
+    reminder_type: str,
+    decision: str,
+    reason: Optional[str] = None,
+    event_id: Optional[str] = None,
+    task_id: Optional[int] = None,
+    alarm_id: Optional[int] = None,
+    event_start_time: Optional[str] = None,
+    minutes_until_start: Optional[int] = None,
+    matched_window: Optional[str] = None,
+    telegram_response: Optional[Dict[str, Any]] = None,
+    metadata: Optional[Dict[str, Any]] = None
+):
+    """Log structured timeline data for the reminder pipeline."""
+    try:
+        payload = {
+            "chat_id": chat_id,
+            "reminder_type": reminder_type,
+            "decision": decision,
+            "reason": reason,
+            "event_id": event_id,
+            "task_id": task_id,
+            "alarm_id": alarm_id,
+            "event_start_time": event_start_time,
+            "minutes_until_start": minutes_until_start,
+            "matched_window": matched_window,
+            "telegram_response": telegram_response,
+            "metadata": metadata or {}
+        }
+        await run_in_threadpool(
+            lambda: supabase.table("reminder_logs").insert(payload).execute()
+        )
+    except Exception as e:
+        print(f"Error logging reminder timeline: {e}")
+
+
 async def get_user_context(chat_id: str) -> Dict[str, Any]:
     """Fetch user context from Supabase, creating it if it doesn't exist."""
     try:
@@ -352,7 +389,12 @@ class NudgeEngine:
                 )
                 for alarm in alarms_resp.data:
                     chat_id = alarm["chat_id"]
-                    await send_telegram_message(chat_id, f"🚨 ALARM: {alarm['message']}", reminder_type="alarm")
+                    await send_telegram_message(
+                        chat_id,
+                        f"🚨 ALARM: {alarm['message']}",
+                        reminder_type="alarm",
+                        alarm_id=alarm["id"]
+                    )
                     await run_in_threadpool(
                         lambda: self.supabase.table("user_alarms")
                         .update({"status": "triggered", "triggered_at": now.isoformat()})
@@ -378,7 +420,8 @@ class NudgeEngine:
                         chat_id,
                         f"⚠️ ESCALATION: You haven't acknowledged your alarm: {alarm['message']}. "
                         "Your 'Probability of Outage' is increasing. Action required.",
-                        reminder_type="alarm_escalation"
+                        reminder_type="alarm_escalation",
+                        alarm_id=alarm["id"]
                     )
                     await run_in_threadpool(
                         lambda: self.supabase.table("user_alarms")
@@ -413,27 +456,64 @@ class NudgeEngine:
                     if last_interaction_str:
                         last_interaction = datetime.fromisoformat(last_interaction_str)
                         if (now - last_interaction) < timedelta(minutes=10):
-                            print(f"🤫 Nag Kill-Switch: Recent interaction ({now - last_interaction}). Skipping task nudge.")
+                            reason = f"Nag Kill-Switch: Recent interaction ({now - last_interaction})."
+                            print(f"🤫 {reason} Skipping task nudge.")
+                            await log_reminder_timeline(
+                                chat_id=chat_id,
+                                reminder_type="task_nudge",
+                                decision="suppressed",
+                                reason=reason,
+                                task_id=task["id"]
+                            )
                             continue
                         if (now - last_interaction) < timedelta(hours=3):
                             # 3-hour suppression for non-escalation nudges
                             # Check if it's a "Deep Work" reminder context
                             if ctx.get("current_block_type") in ["calendar_focus", "pomodoro"]:
-                                print(f"🤫 Suppression: Under 3h since interaction. Skipping Deep Work reminder.")
+                                reason = f"Suppression: Under 3h since interaction ({now - last_interaction}) and in {ctx['current_block_type']}."
+                                print(f"🤫 {reason} Skipping Deep Work reminder.")
+                                await log_reminder_timeline(
+                                    chat_id=chat_id,
+                                    reminder_type="task_nudge",
+                                    decision="suppressed",
+                                    reason=reason,
+                                    task_id=task["id"]
+                                )
                                 continue
 
                     if state.get("pomodoro_active"):
-                        print(f"🤫 Pomodoro Lock active. Skipping non-essential nudge.")
+                        reason = "Pomodoro Lock active."
+                        print(f"🤫 {reason} Skipping non-essential nudge.")
+                        await log_reminder_timeline(
+                            chat_id=chat_id,
+                            reminder_type="task_nudge",
+                            decision="suppressed",
+                            reason=reason,
+                            task_id=task["id"]
+                        )
                         continue
 
                     if ctx.get("current_block_type"):
-                        print(f"🤫 Silent Mode active ({ctx['current_block_type']}). Skipping task nudge.")
+                        reason = f"Silent Mode active ({ctx['current_block_type']})."
+                        print(f"🤫 {reason} Skipping task nudge.")
+                        await log_reminder_timeline(
+                            chat_id=chat_id,
+                            reminder_type="task_nudge",
+                            decision="suppressed",
+                            reason=reason,
+                            task_id=task["id"]
+                        )
                         continue
 
                     if chat_id not in vetted_ps_cache:
                         vetted_ps_cache[chat_id] = await executive_sync_service._get_vetted_ps(chat_id)
 
-                    await send_telegram_message(chat_id, f"🕒 TASK DUE: {task['title']}{vetted_ps_cache[chat_id]}", reminder_type="task_nudge")
+                    await send_telegram_message(
+                        chat_id,
+                        f"🕒 TASK DUE: {task['title']}{vetted_ps_cache[chat_id]}",
+                        reminder_type="task_nudge",
+                        task_id=task["id"]
+                    )
                     await run_in_threadpool(
                         lambda: self.supabase.table("user_tasks")
                         .update({"triggered_at": now.isoformat()})
@@ -460,18 +540,35 @@ class NudgeEngine:
 
                     # Escalations bypass the 10m/3h suppression but respect Pomodoro Lock if not an alarm
                     if state.get("pomodoro_active"):
-                        print(f"🤫 Pomodoro Lock active. Skipping task escalation.")
+                        reason = "Pomodoro Lock active during task escalation."
+                        print(f"🤫 {reason} Skipping task escalation.")
+                        await log_reminder_timeline(
+                            chat_id=chat_id,
+                            reminder_type="task_escalation",
+                            decision="suppressed",
+                            reason=reason,
+                            task_id=task["id"]
+                        )
                         continue
 
                     if ctx.get("current_block_type"):
-                        print(f"🤫 Silent Mode active ({ctx['current_block_type']}). Skipping task escalation.")
+                        reason = f"Silent Mode active ({ctx['current_block_type']}) during task escalation."
+                        print(f"🤫 {reason} Skipping task escalation.")
+                        await log_reminder_timeline(
+                            chat_id=chat_id,
+                            reminder_type="task_escalation",
+                            decision="suppressed",
+                            reason=reason,
+                            task_id=task["id"]
+                        )
                         continue
 
                     await send_telegram_message(
                         chat_id,
                         f"⚠️ ESCALATION: Task '{task['title']}' is still pending! "
                         "This is impacting your 'Probability of Outage'. Bro, get it done.",
-                        reminder_type="task_escalation"
+                        reminder_type="task_escalation",
+                        task_id=task["id"]
                     )
                     await run_in_threadpool(
                         lambda: self.supabase.table("user_tasks")
@@ -496,7 +593,12 @@ class NudgeEngine:
                     target_chat_id = session.get("chat_id") or session["user_id"]
                     session_type = session["type"]
                     msg = "🔔 Time's up! Pomodoro session completed. Take a break, G." if session_type == "work" else "🔔 Break's over! Let's get back to it."
-                    await send_telegram_message(target_chat_id, msg, reminder_type="pomodoro_alert")
+                    await send_telegram_message(
+                        target_chat_id,
+                        msg,
+                        reminder_type="pomodoro_alert",
+                        task_id=session.get("task_id")
+                    )
                     await update_user_state(target_chat_id, pomodoro_active=False)
                     await run_in_threadpool(
                         lambda: self.supabase.table("pomodoro_sessions")
@@ -620,7 +722,20 @@ class ExecutiveSyncService:
                     current_block_type=current_block_type,
                     current_block_id=current_block_id
                 )
-                print(f"🔄 Block state updated: {current_block_type} ({current_block_id})")
+                reason = f"Block state transition: {previous_block_type} -> {current_block_type}"
+                print(f"🔄 {reason} ({current_block_id})")
+                await log_reminder_timeline(
+                    chat_id=self.chat_id,
+                    reminder_type="block_sync",
+                    decision="info",
+                    reason=reason,
+                    metadata={
+                        "previous_block_type": previous_block_type,
+                        "current_block_type": current_block_type,
+                        "previous_block_id": previous_block_id,
+                        "current_block_id": current_block_id
+                    }
+                )
 
             # 3. The 'Suspicious Silence' Nudge
             if not current_block_type:
@@ -650,6 +765,15 @@ class ExecutiveSyncService:
                                     await send_telegram_message(self.chat_id, msg, reminder_type="suspicious_silence")
                                     await update_user_context(self.chat_id, last_suspicious_silence_at=now.isoformat())
                                     print("🧐 Suspicious Silence Nudge sent.")
+                                else:
+                                    reason = f"Suspicious Silence suppressed: Under 3h since last interaction ({now - last_interaction})."
+                                    print(f"🤫 {reason}")
+                                    await log_reminder_timeline(
+                                        chat_id=self.chat_id,
+                                        reminder_type="suspicious_silence",
+                                        decision="suppressed",
+                                        reason=reason
+                                    )
 
             # 4. General Inactivity Nudge (MIA for 6+ hours)
             if 9 <= now.hour <= 21:
@@ -677,6 +801,19 @@ class ExecutiveSyncService:
                             await send_telegram_message(self.chat_id, msg, reminder_type="inactivity_nudge")
                             await update_user_context(self.chat_id, last_inactivity_nudge_at=now.isoformat())
                             print("🧐 General Inactivity Nudge sent.")
+                        else:
+                            reason = "General Inactivity nudge skipped: No pending tasks."
+                            print(f"🤫 {reason}")
+                            await log_reminder_timeline(
+                                chat_id=self.chat_id,
+                                reminder_type="inactivity_nudge",
+                                decision="skipped",
+                                reason=reason
+                            )
+                else:
+                    reason = f"General Inactivity suppressed: Under 6h since last interaction ({now - last_interaction})."
+                    # We don't want to spam logs every minute for this, maybe only log if it was a candidate
+                    pass
 
         except Exception as e:
             print(f"❌ ExecutiveSyncService Error: {e}")
@@ -815,7 +952,19 @@ async def store_message(chat_id: str, role: str, content: str):
         print(f"Error storing message: {e}")
 
 
-async def send_telegram_message(chat_id: str, text: str, reply_to_message_id: Optional[int] = None, reminder_type: Optional[str] = None):
+async def send_telegram_message(
+    chat_id: str,
+    text: str,
+    reply_to_message_id: Optional[int] = None,
+    reminder_type: Optional[str] = None,
+    event_id: Optional[str] = None,
+    task_id: Optional[int] = None,
+    alarm_id: Optional[int] = None,
+    event_start_time: Optional[str] = None,
+    minutes_until_start: Optional[int] = None,
+    matched_window: Optional[str] = None,
+    metadata: Optional[Dict[str, Any]] = None
+):
     """Send a message back to the Telegram chat."""
     global last_nudge_sent_at
     try:
@@ -827,8 +976,23 @@ async def send_telegram_message(chat_id: str, text: str, reply_to_message_id: Op
 
                 # 1. 1-hour Cool-down check
                 if last_nudge_sent_at:
-                    if (now - last_nudge_sent_at) < timedelta(hours=1):
-                        print(f"🤫 Cool-down active. Last nudge was {(now - last_nudge_sent_at).total_seconds()/60:.1f}m ago. Skipping {reminder_type}.")
+                    diff = now - last_nudge_sent_at
+                    if diff < timedelta(hours=1):
+                        reason = f"Cool-down active. Last nudge was {diff.total_seconds()/60:.1f}m ago."
+                        print(f"🤫 {reason} Skipping {reminder_type}.")
+                        await log_reminder_timeline(
+                            chat_id=chat_id,
+                            reminder_type=reminder_type,
+                            decision="suppressed",
+                            reason=reason,
+                            event_id=event_id,
+                            task_id=task_id,
+                            alarm_id=alarm_id,
+                            event_start_time=event_start_time,
+                            minutes_until_start=minutes_until_start,
+                            matched_window=matched_window,
+                            metadata=metadata
+                        )
                         return
 
                 # 2. Global Mute check
@@ -838,19 +1002,67 @@ async def send_telegram_message(chat_id: str, text: str, reply_to_message_id: Op
                     if muted_until_str:
                         muted_until = datetime.fromisoformat(muted_until_str)
                         if now < muted_until:
-                            print(f"🤫 User is muted until {muted_until_str}. Skipping {reminder_type}.")
+                            reason = f"User is muted until {muted_until_str}."
+                            print(f"🤫 {reason} Skipping {reminder_type}.")
+                            await log_reminder_timeline(
+                                chat_id=chat_id,
+                                reminder_type=reminder_type,
+                                decision="suppressed",
+                                reason=reason,
+                                event_id=event_id,
+                                task_id=task_id,
+                                alarm_id=alarm_id,
+                                event_start_time=event_start_time,
+                                minutes_until_start=minutes_until_start,
+                                matched_window=matched_window,
+                                metadata=metadata
+                            )
                             return
 
         # Check for duplicate reminders
         if reminder_type:
             if await should_skip_reminder(chat_id, reminder_type, text):
-                print(f"🚫 Skipping duplicate reminder: {reminder_type}")
+                reason = "Duplicate reminder detected within last 5 minutes."
+                print(f"🚫 {reason} {reminder_type}")
+                await log_reminder_timeline(
+                    chat_id=chat_id,
+                    reminder_type=reminder_type,
+                    decision="skipped",
+                    reason=reason,
+                    event_id=event_id,
+                    task_id=task_id,
+                    alarm_id=alarm_id,
+                    event_start_time=event_start_time,
+                    minutes_until_start=minutes_until_start,
+                    matched_window=matched_window,
+                    metadata=metadata
+                )
                 return
 
-        success = await telegram_client.send_message(
+        result = await telegram_client.send_message(
             chat_id=chat_id,
             text=text,
             reply_to_message_id=reply_to_message_id
+        )
+
+        success = result.get("success", False)
+        response_data = result.get("response")
+        error = result.get("error")
+
+        # Log timeline
+        await log_reminder_timeline(
+            chat_id=chat_id,
+            reminder_type=reminder_type or "manual",
+            decision="sent" if success else "failed",
+            reason=error if not success else None,
+            event_id=event_id,
+            task_id=task_id,
+            alarm_id=alarm_id,
+            event_start_time=event_start_time,
+            minutes_until_start=minutes_until_start,
+            matched_window=matched_window,
+            telegram_response=response_data,
+            metadata=metadata
         )
 
         if success:
@@ -1152,6 +1364,16 @@ async def check_upcoming_events():
         now = datetime.now(ZoneInfo("Africa/Nairobi"))
         windows = [15, 5, 0]
 
+        # Log cycle start for the main user for visibility
+        if MUCHIRI_CHAT_ID:
+            await log_reminder_timeline(
+                chat_id=MUCHIRI_CHAT_ID,
+                reminder_type="scheduler_cycle",
+                decision="info",
+                reason="Starting check_upcoming_events cycle.",
+                metadata={"windows": windows, "now": now.isoformat()}
+            )
+
         for window in windows:
             target_time = now + timedelta(minutes=window)
             # Query events starting within a 1-minute window around the target_time
@@ -1166,12 +1388,31 @@ async def check_upcoming_events():
                 .execute()
             )
 
+            # Log retrieval
+            for chat_id_item in {e.get("chat_id") for e in res.data if e.get("chat_id")}:
+                await log_reminder_timeline(
+                    chat_id=chat_id_item,
+                    reminder_type=f"event_reminder_{window}m",
+                    decision="attempted",
+                    reason=f"Retrieved {len([e for e in res.data if e.get('chat_id') == chat_id_item])} events for {window}m window.",
+                    matched_window=f"{window}m",
+                    metadata={"retrieved_count": len(res.data), "start_range": start_range, "end_range": end_range}
+                )
+
+            if not res.data:
+                # Optional: Log empty cycles for a specific chat if we want total visibility
+                pass
+
             for event in res.data:
                 chat_id = event.get("chat_id")
                 if not chat_id: continue
 
                 event_id = event["event_id"]
                 reminder_type = f"event_reminder_{window}m"
+                event_start_time = event["start_time"]
+
+                start_dt = datetime.fromisoformat(event_start_time.replace('Z', '+00:00')).astimezone(ZoneInfo("Africa/Nairobi"))
+                minutes_until_start = int((start_dt - now).total_seconds() / 60)
 
                 # Check if already sent
                 sent_res = await run_in_threadpool(
@@ -1183,20 +1424,41 @@ async def check_upcoming_events():
                     .execute()
                 )
 
-                if not sent_res.data:
-                    briefing = await generate_event_briefing(event, window)
-                    await send_telegram_message(chat_id, briefing, reminder_type=reminder_type)
-                    # Log with event_id
-                    await run_in_threadpool(
-                        lambda: supabase.table("sent_reminders").insert({
-                            "chat_id": chat_id,
-                            "reminder_type": reminder_type,
-                            "content": briefing,
-                            "event_id": event_id,
-                            "event_start_time": event["start_time"],
-                            "sent_at": datetime.now(ZoneInfo("Africa/Nairobi")).isoformat()
-                        }).execute()
+                if sent_res.data:
+                    await log_reminder_timeline(
+                        chat_id=chat_id,
+                        reminder_type=reminder_type,
+                        decision="skipped",
+                        reason="Event reminder already logged in sent_reminders.",
+                        event_id=event_id,
+                        event_start_time=event_start_time,
+                        minutes_until_start=minutes_until_start,
+                        matched_window=f"{window}m"
                     )
+                    continue
+
+                briefing = await generate_event_briefing(event, window)
+                await send_telegram_message(
+                    chat_id,
+                    briefing,
+                    reminder_type=reminder_type,
+                    event_id=event_id,
+                    event_start_time=event_start_time,
+                    minutes_until_start=minutes_until_start,
+                    matched_window=f"{window}m"
+                )
+
+                # Log with event_id
+                await run_in_threadpool(
+                    lambda: supabase.table("sent_reminders").insert({
+                        "chat_id": chat_id,
+                        "reminder_type": reminder_type,
+                        "content": briefing,
+                        "event_id": event_id,
+                        "event_start_time": event["start_time"],
+                        "sent_at": datetime.now(ZoneInfo("Africa/Nairobi")).isoformat()
+                    }).execute()
+                )
 
     except Exception as e:
         print(f"Error in check_upcoming_events: {e}")
