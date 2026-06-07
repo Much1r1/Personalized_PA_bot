@@ -30,46 +30,70 @@ from google.auth.transport.requests import Request as GoogleRequest
 
 load_dotenv()
 
-# Environment Variables
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-MUCHIRI_CHAT_ID = os.getenv("MUCHIRI_CHAT_ID")
+# ─── Environment Variables ────────────────────────────────────────────────────
+TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN")
+SUPABASE_URL     = os.getenv("SUPABASE_URL")
+SUPABASE_KEY     = os.getenv("SUPABASE_KEY")
+GROQ_API_KEY     = os.getenv("GROQ_API_KEY")
+GEMINI_API_KEY   = os.getenv("GEMINI_API_KEY")
+MUCHIRI_CHAT_ID  = os.getenv("MUCHIRI_CHAT_ID")
 
-# Initialize Clients
-groq_client = AsyncGroq(api_key=GROQ_API_KEY)
+# ─── Initialize Clients ───────────────────────────────────────────────────────
+groq_client      = AsyncGroq(api_key=GROQ_API_KEY)
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-scheduler = AsyncIOScheduler(timezone=ZoneInfo("Africa/Nairobi"))
+scheduler        = AsyncIOScheduler(timezone=ZoneInfo("Africa/Nairobi"))
 pomodoro_service = PomodoroService(supabase)
 intent_classifier = IntentClassifier(groq_client, supabase)
 
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
 
-# Context variable to store chat_id
+# Context variable to store chat_id per request
 current_chat_id: ContextVar[str] = ContextVar("current_chat_id")
 
-# State for proactive nudges
-last_nudge_sent_at: Optional[datetime] = None
+# ─── Per-type cooldown registry (replaces single global last_nudge_sent_at) ───
+# Key: reminder_type  →  Value: last datetime it was sent
+nudge_sent_registry: Dict[str, datetime] = {}
 
+# How long each nudge type is suppressed after firing.
+# Types NOT listed here fire freely (alarms, pomodoro_alert, etc.)
+NUDGE_COOLDOWNS: Dict[str, timedelta] = {
+    "task_nudge":          timedelta(hours=2),
+    "task_escalation":     timedelta(hours=1),
+    "inactivity_nudge":    timedelta(hours=6),
+    "velocity_nudge":      timedelta(hours=4),
+    "suspicious_silence":  timedelta(hours=3),
+    "morning_briefing":    timedelta(hours=20),
+    "morning_check":       timedelta(hours=20),
+    "evening_review_proactive": timedelta(hours=20),
+    "hydration":           timedelta(hours=2, minutes=30),
+    "movement":            timedelta(hours=2, minutes=30),
+    "habit_alert":         timedelta(hours=12),
+}
+
+# Nudge types that always go through regardless of cooldown or mute
+BYPASS_ALL = {
+    "alarm",
+    "alarm_escalation",
+    "pomodoro_alert",
+    "manual_nudge_request",
+}
+
+
+# ─── User State / Context helpers ─────────────────────────────────────────────
 
 async def get_user_state(chat_id: str) -> Dict[str, Any]:
-    """Fetch user state from Supabase, creating it if it doesn't exist."""
     try:
         res = await run_in_threadpool(
             lambda: supabase.table("user_state").select("*").eq("chat_id", chat_id).execute()
         )
         if res.data:
             return res.data[0]
-
-        # Create default state if missing
         default_state = {
             "chat_id": chat_id,
             "pomodoro_active": False,
             "is_muted": False,
-            "muted_until": None
+            "muted_until": None,
         }
         res = await run_in_threadpool(
             lambda: supabase.table("user_state").insert(default_state).execute()
@@ -77,16 +101,10 @@ async def get_user_state(chat_id: str) -> Dict[str, Any]:
         return res.data[0]
     except Exception as e:
         print(f"Error fetching user state: {e}")
-        return {
-            "chat_id": chat_id,
-            "pomodoro_active": False,
-            "is_muted": False,
-            "muted_until": None
-        }
+        return {"chat_id": chat_id, "pomodoro_active": False, "is_muted": False, "muted_until": None}
 
 
 async def update_user_state(chat_id: str, **kwargs):
-    """Update user state in Supabase."""
     try:
         kwargs["updated_at"] = datetime.now(ZoneInfo("Africa/Nairobi")).isoformat()
         await run_in_threadpool(
@@ -96,8 +114,36 @@ async def update_user_state(chat_id: str, **kwargs):
         print(f"Error updating user state: {e}")
 
 
+async def get_user_context(chat_id: str) -> Dict[str, Any]:
+    try:
+        res = await run_in_threadpool(
+            lambda: supabase.table("user_context").select("*").eq("chat_id", chat_id).execute()
+        )
+        if res.data:
+            return res.data[0]
+        default_ctx = {"chat_id": chat_id}
+        res = await run_in_threadpool(
+            lambda: supabase.table("user_context").insert(default_ctx).execute()
+        )
+        return res.data[0]
+    except Exception as e:
+        print(f"Error fetching user context: {e}")
+        return {"chat_id": chat_id, "current_block_type": None}
+
+
+async def update_user_context(chat_id: str, **kwargs):
+    try:
+        kwargs["updated_at"] = datetime.now(ZoneInfo("Africa/Nairobi")).isoformat()
+        await run_in_threadpool(
+            lambda: supabase.table("user_context").update(kwargs).eq("chat_id", chat_id).execute()
+        )
+    except Exception as e:
+        print(f"Error updating user context: {e}")
+
+
+# ─── Duplicate-reminder guard ─────────────────────────────────────────────────
+
 async def should_skip_reminder(chat_id: str, reminder_type: str, content: str) -> bool:
-    """Check if a similar reminder was sent within the last 5 minutes."""
     try:
         five_mins_ago = (datetime.now(ZoneInfo("Africa/Nairobi")) - timedelta(minutes=5)).isoformat()
         res = await run_in_threadpool(
@@ -108,7 +154,6 @@ async def should_skip_reminder(chat_id: str, reminder_type: str, content: str) -
             .gte("sent_at", five_mins_ago)
             .execute()
         )
-        # Check for similar content (simple match for now)
         for reminder in res.data:
             if reminder["content"] == content:
                 return True
@@ -119,13 +164,12 @@ async def should_skip_reminder(chat_id: str, reminder_type: str, content: str) -
 
 
 async def log_sent_reminder(chat_id: str, reminder_type: str, content: str):
-    """Log a sent reminder to Supabase."""
     try:
         payload = {
             "chat_id": chat_id,
             "reminder_type": reminder_type,
             "content": content,
-            "sent_at": datetime.now(ZoneInfo("Africa/Nairobi")).isoformat()
+            "sent_at": datetime.now(ZoneInfo("Africa/Nairobi")).isoformat(),
         }
         await run_in_threadpool(
             lambda: supabase.table("sent_reminders").insert(payload).execute()
@@ -205,7 +249,7 @@ async def update_user_context(chat_id: str, **kwargs):
 def get_google_creds():
     try:
         if not SUPABASE_URL or not SUPABASE_KEY:
-            print("❌ M-Bot Error: SUPABASE_URL or KEY is missing from Env Vars")
+            print("❌ M-Bot Error: SUPABASE_URL or KEY missing")
             return None
 
         res = supabase.table("system_config").select("value").eq("key", "google_token").execute()
@@ -217,7 +261,6 @@ def get_google_creds():
         if isinstance(token_data, str):
             token_data = json.loads(token_data)
 
-        # Parse expiry so creds.expired works correctly
         expiry_str = token_data.get("expiry")
         expiry = datetime.fromisoformat(expiry_str) if expiry_str else None
 
@@ -228,29 +271,27 @@ def get_google_creds():
             client_id=token_data.get("client_id") or os.getenv("GOOGLE_CLIENT_ID"),
             client_secret=token_data.get("client_secret") or os.getenv("GOOGLE_CLIENT_SECRET"),
             scopes=token_data.get("scopes"),
-            expiry=expiry  # ← critical: without this, creds.expired is always False
+            expiry=expiry,
         )
 
         if creds and creds.expired and creds.refresh_token:
             print("🔄 Refreshing Google OAuth token...")
             creds.refresh(GoogleRequest())
-
-            # Persist the refreshed token back to Supabase
-            updated_token_data = {
+            updated = {
                 "token": creds.token,
                 "refresh_token": creds.refresh_token,
                 "token_uri": creds.token_uri,
                 "client_id": creds.client_id,
                 "client_secret": creds.client_secret,
                 "scopes": list(creds.scopes),
-                "expiry": creds.expiry.isoformat() if creds.expiry else None  # ← persist expiry too
+                "expiry": creds.expiry.isoformat() if creds.expiry else None,
             }
-            supabase.table("system_config").update({"value": updated_token_data}).eq("key", "google_token").execute()
-            print("✅ Google token refreshed and saved to Supabase.")
+            supabase.table("system_config").update({"value": updated}).eq("key", "google_token").execute()
+            print("✅ Google token refreshed and saved.")
 
         return creds
     except Exception as e:
-        print(f"⚠️ M-Bot Auth Crash Detail: {type(e).__name__} - {str(e)}")
+        print(f"⚠️ M-Bot Auth Crash: {type(e).__name__} - {e}")
         return None
 
 
@@ -258,28 +299,22 @@ SCOPES = ['https://www.googleapis.com/auth/calendar.readonly']
 
 
 def get_calendar_events(max_results: int = 5) -> str:
-    """Queries Google Calendar API directly."""
     try:
         creds = get_google_creds()
         if not creds:
             return "Authentication failed. Check your Google Calendar connection."
 
         service = build('calendar', 'v3', credentials=creds)
-
-        # Sync to Africa/Nairobi
         now_nairobi = datetime.now(ZoneInfo("Africa/Nairobi"))
-        now_iso = now_nairobi.isoformat()
-
         events_result = service.events().list(
             calendarId='primary',
-            timeMin=now_iso,
+            timeMin=now_nairobi.isoformat(),
             maxResults=max_results,
             singleEvents=True,
-            orderBy='startTime'
+            orderBy='startTime',
         ).execute()
 
         events = events_result.get('items', [])
-
         if not events:
             return "No upcoming events found."
 
@@ -290,18 +325,16 @@ def get_calendar_events(max_results: int = 5) -> str:
             event_list.append(f"- {display_time}: {event.get('summary')}")
 
         return "\n".join(event_list)
-
     except Exception as e:
         print(f"Calendar API Error: {e}")
         return "Couldn't fetch your schedule right now, bro."
 
 
 async def get_scannable_briefing(chat_id: str) -> str:
-    """Pull the day's events from the calendar_items table and format as a Scannable List."""
     try:
         now = datetime.now(ZoneInfo("Africa/Nairobi"))
         start_of_day = now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
-        end_of_day = now.replace(hour=23, minute=59, second=59, microsecond=999999).isoformat()
+        end_of_day   = now.replace(hour=23, minute=59, second=59, microsecond=999999).isoformat()
 
         res = await run_in_threadpool(
             lambda: supabase.table("calendar_items")
@@ -318,9 +351,10 @@ async def get_scannable_briefing(chat_id: str) -> str:
 
         lines = ["Today's Schedule:"]
         for item in res.data:
-            start_dt = datetime.fromisoformat(item["start_time"].replace('Z', '+00:00')).astimezone(ZoneInfo("Africa/Nairobi"))
-            time_str = start_dt.strftime("%H:%M")
-            lines.append(f"- {time_str}: {item['summary']}")
+            start_dt = datetime.fromisoformat(
+                item["start_time"].replace('Z', '+00:00')
+            ).astimezone(ZoneInfo("Africa/Nairobi"))
+            lines.append(f"- {start_dt.strftime('%H:%M')}: {item['summary']}")
 
         return "\n".join(lines)
     except Exception as e:
@@ -329,9 +363,10 @@ async def get_scannable_briefing(chat_id: str) -> str:
 
 
 def get_schedule(max_results: int = 5) -> str:
-    """Retrieves the user's upcoming calendar events."""
     return get_calendar_events(max_results)
 
+
+# ─── Pydantic models ───────────────────────────────────────────────────────────
 
 class NudgeRequest(BaseModel):
     message: Optional[str] = "Yo Muchiri, just checking in!"
@@ -342,6 +377,8 @@ class BrainDump(BaseModel):
     tags: List[str] = []
     metadata: Dict[str, Any] = {}
 
+
+# ─── Function dispatcher for Gemini tool calls ────────────────────────────────
 
 class FunctionDispatcher:
     def __init__(self):
@@ -356,8 +393,7 @@ class FunctionDispatcher:
         if func_name in self.tools:
             if asyncio.iscoroutinefunction(self.tools[func_name]):
                 return await self.tools[func_name](**args)
-            else:
-                return await run_in_threadpool(lambda: self.tools[func_name](**args))
+            return await run_in_threadpool(lambda: self.tools[func_name](**args))
         raise ValueError(f"Unknown tool: {func_name}")
 
 
@@ -365,20 +401,84 @@ dispatcher = FunctionDispatcher()
 dispatcher.register("get_calendar_events", get_calendar_events)
 
 
+# ─── Core send function ────────────────────────────────────────────────────────
+
+telegram_client = TelegramClient(TELEGRAM_TOKEN)
+
+
+async def send_telegram_message(
+    chat_id: str,
+    text: str,
+    reply_to_message_id: Optional[int] = None,
+    reminder_type: Optional[str] = None,
+):
+    """
+    Send a Telegram message with unified cooldown + mute logic.
+
+    Guard order:
+      1. BYPASS_ALL types skip every guard.
+      2. Per-type cooldown check (nudge_sent_registry).
+      3. Global mute check (skips scheduled wellness/escalation types).
+      4. Duplicate content check (5-min window).
+    """
+    try:
+        now = datetime.now(ZoneInfo("Africa/Nairobi"))
+
+        if reminder_type and reminder_type not in BYPASS_ALL:
+
+            # 1. Per-type cooldown
+            if reminder_type in NUDGE_COOLDOWNS:
+                last_sent = nudge_sent_registry.get(reminder_type)
+                if last_sent and (now - last_sent) < NUDGE_COOLDOWNS[reminder_type]:
+                    elapsed = (now - last_sent).total_seconds() / 60
+                    print(f"🤫 [{reminder_type}] on cooldown — {elapsed:.1f}m since last send. Skipping.")
+                    return
+
+            # 2. Global mute (does not apply to escalations or task alerts)
+            MUTE_EXEMPT = {"task_escalation", "alarm_escalation", "suspicious_silence"}
+            if reminder_type not in MUTE_EXEMPT and chat_id == MUCHIRI_CHAT_ID:
+                state = await get_user_state(chat_id)
+                if state.get("is_muted"):
+                    muted_until_str = state.get("muted_until")
+                    if muted_until_str:
+                        muted_until = datetime.fromisoformat(muted_until_str)
+                        if now < muted_until:
+                            print(f"🤫 Muted until {muted_until_str}. Skipping [{reminder_type}].")
+                            return
+
+            # 3. Duplicate content guard
+            if await should_skip_reminder(chat_id, reminder_type, text):
+                print(f"🚫 Duplicate guard hit for [{reminder_type}]. Skipping.")
+                return
+
+        success = await telegram_client.send_message(
+            chat_id=chat_id,
+            text=text,
+            reply_to_message_id=reply_to_message_id,
+        )
+
+        if success and reminder_type:
+            await log_sent_reminder(chat_id, reminder_type, text)
+            # Update per-type cooldown registry
+            if reminder_type in NUDGE_COOLDOWNS:
+                nudge_sent_registry[reminder_type] = now
+
+    except Exception as e:
+        print(f"Error sending Telegram message: {e}")
+
+
+# ─── Nudge Engine (alarms + task nudges) ──────────────────────────────────────
+
 class NudgeEngine:
     def __init__(self, supabase_client: Client):
         self.supabase = supabase_client
 
     async def check_alerts(self):
-        """
-        Job that queries user_tasks and user_alarms.
-        Handles proactive messaging and the Escalation Policy.
-        """
         try:
             now = datetime.now(ZoneInfo("Africa/Nairobi"))
             escalation_time = now - timedelta(minutes=5)
 
-            # 1. Handle Alarms (Always processed regardless of Silent Mode)
+            # 1. Alarms — always fire
             try:
                 alarms_resp = await run_in_threadpool(
                     lambda: self.supabase.table("user_alarms")
@@ -402,9 +502,9 @@ class NudgeEngine:
                         .execute()
                     )
             except Exception as e:
-                print(f"Nudge Engine Alarms Error: {e}")
+                print(f"NudgeEngine Alarms Error: {e}")
 
-            # 2. Handle Escalation Policy (5-minute rule)
+            # 2. Alarm escalation
             try:
                 escalation_resp = await run_in_threadpool(
                     lambda: self.supabase.table("user_alarms")
@@ -430,11 +530,11 @@ class NudgeEngine:
                         .execute()
                     )
             except Exception as e:
-                print(f"Nudge Engine Alarm Escalation Error: {e}")
+                print(f"NudgeEngine Alarm Escalation Error: {e}")
 
-            # --- PROACTIVE NUDGES BELOW (Subject to Silent Mode) ---
-
-            # 3. Handle Tasks due for nudge
+            # 3. Task nudges
+            # Suppression: skip if Pomodoro active OR in a focus block.
+            # Interaction-time suppression removed — the per-type cooldown handles spacing.
             try:
                 tasks_resp = await run_in_threadpool(
                     lambda: self.supabase.table("user_tasks")
@@ -448,7 +548,7 @@ class NudgeEngine:
                 vetted_ps_cache = {}
                 for task in tasks_resp.data:
                     chat_id = task["chat_id"]
-                    ctx = await get_user_context(chat_id)
+                    ctx   = await get_user_context(chat_id)
                     state = await get_user_state(chat_id)
 
                     # Suppression Logic
@@ -492,7 +592,6 @@ class NudgeEngine:
                             task_id=task["id"]
                         )
                         continue
-
                     if ctx.get("current_block_type"):
                         reason = f"Silent Mode active ({ctx['current_block_type']})."
                         print(f"🤫 {reason} Skipping task nudge.")
@@ -521,11 +620,11 @@ class NudgeEngine:
                         .execute()
                     )
             except Exception as e:
-                print(f"Nudge Engine Tasks Error: {e}")
+                print(f"NudgeEngine Tasks Error: {e}")
 
-            # Tasks escalation
+            # 4. Task escalation
             try:
-                task_escalation_resp = await run_in_threadpool(
+                task_esc_resp = await run_in_threadpool(
                     lambda: self.supabase.table("user_tasks")
                     .select("*")
                     .eq("status", "pending")
@@ -533,12 +632,11 @@ class NudgeEngine:
                     .is_("acknowledged_at", "null")
                     .execute()
                 )
-                for task in task_escalation_resp.data:
+                for task in task_esc_resp.data:
                     chat_id = task["chat_id"]
-                    ctx = await get_user_context(chat_id)
-                    state = await get_user_state(chat_id)
+                    state   = await get_user_state(chat_id)
+                    ctx     = await get_user_context(chat_id)
 
-                    # Escalations bypass the 10m/3h suppression but respect Pomodoro Lock if not an alarm
                     if state.get("pomodoro_active"):
                         reason = "Pomodoro Lock active during task escalation."
                         print(f"🤫 {reason} Skipping task escalation.")
@@ -550,7 +648,6 @@ class NudgeEngine:
                             task_id=task["id"]
                         )
                         continue
-
                     if ctx.get("current_block_type"):
                         reason = f"Silent Mode active ({ctx['current_block_type']}) during task escalation."
                         print(f"🤫 {reason} Skipping task escalation.")
@@ -577,9 +674,9 @@ class NudgeEngine:
                         .execute()
                     )
             except Exception as e:
-                print(f"Nudge Engine Task Escalation Error: {e}")
+                print(f"NudgeEngine Task Escalation Error: {e}")
 
-            # 4. Handle Pomodoro sessions (System alerts, not subject to Silent Mode)
+            # 5. Pomodoro session completions — system alert, always fires
             try:
                 pomodoro_resp = await run_in_threadpool(
                     lambda: self.supabase.table("pomodoro_sessions")
@@ -607,17 +704,16 @@ class NudgeEngine:
                         .execute()
                     )
             except Exception as e:
-                print(f"Nudge Engine Pomodoro Error: {e}")
+                print(f"NudgeEngine Pomodoro Error: {e}")
 
         except Exception as e:
-            print(f"Nudge Engine Error: {e}")
+            print(f"NudgeEngine top-level Error: {e}")
 
 
 nudge_engine_service = NudgeEngine(supabase)
 
-# Initialize Telegram Client
-telegram_client = TelegramClient(TELEGRAM_TOKEN)
 
+# ─── Executive Sync Service ────────────────────────────────────────────────────
 
 class ExecutiveSyncService:
     def __init__(self, supabase_client: Client, pomodoro_svc: PomodoroService):
@@ -626,12 +722,10 @@ class ExecutiveSyncService:
         self.chat_id = MUCHIRI_CHAT_ID
 
     async def _get_vetted_ps(self, chat_id: Optional[str] = None) -> str:
-        """Helper to get pending Vetted tickets count as a P.S. string."""
         try:
             query = self.supabase.table("user_tasks").select("*").eq("status", "pending").ilike("title", "%Vetted%")
             if chat_id:
                 query = query.eq("chat_id", chat_id)
-
             res = await run_in_threadpool(lambda: query.execute())
             if res.data:
                 count = len(res.data)
@@ -641,86 +735,67 @@ class ExecutiveSyncService:
         return ""
 
     async def sync_executive_state(self):
-        """
-        Job for the Executive PA logic.
-        """
         if not self.chat_id:
             return
-
         try:
             now = datetime.now(ZoneInfo("Africa/Nairobi"))
             ctx = await get_user_context(self.chat_id)
 
-            # 1. The 8 AM Briefing
-            is_briefing_time = (now.hour == 8 and now.minute == 0)
-            is_retry_time = (now.hour == 8 and now.minute == 15)
-
-            if is_briefing_time or is_retry_time:
+            # 1. 8 AM Briefing (with 15-min retry window)
+            if now.hour == 8 and now.minute < 16:
                 last_briefing = ctx.get("last_briefing_at")
-                is_sent_today = False
+                already_sent = False
                 if last_briefing:
                     lb_dt = datetime.fromisoformat(last_briefing)
                     if lb_dt.date() == now.date():
-                        is_sent_today = True
+                        already_sent = True
 
-                if not is_sent_today:
+                if not already_sent:
                     briefing_content = await get_scannable_briefing(self.chat_id)
-
                     msg = f"Morning Muchiri. Here's your scannable list for today:\n\n{briefing_content}"
-
-                    # Use a dedicated reminder type for duplicate prevention if needed,
-                    # though briefing has its own state tracking.
                     await send_telegram_message(self.chat_id, msg, reminder_type="morning_briefing")
                     await update_user_context(self.chat_id, last_briefing_at=now.isoformat())
-                    print(f"✅ 8 AM Briefing sent (Time: {now.strftime('%H:%M')}).")
+                    print(f"✅ 8 AM Briefing sent ({now.strftime('%H:%M')}).")
 
-            # 2. Elastic Deep Work Sync
+            # 2. Elastic Deep Work Sync — update focus block context
             active_pomodoro = await self.pomodoro_service.get_active_session(self.chat_id)
-
-            # Fetch calendar for current/upcoming events
             creds = await run_in_threadpool(get_google_creds)
-            current_block_id = None
+            current_block_id   = None
             current_block_type = None
 
             if active_pomodoro:
-                current_block_id = active_pomodoro["id"]
+                current_block_id   = active_pomodoro["id"]
                 current_block_type = "pomodoro"
             elif creds:
-                # Use Google Calendar API directly to see if we are currently in a block
                 service = build('calendar', 'v3', credentials=creds)
-                now_iso = now.isoformat()
                 events_result = await run_in_threadpool(
                     lambda: service.events().list(
                         calendarId='primary',
-                        timeMin=now_iso,
+                        timeMin=now.isoformat(),
                         maxResults=5,
                         singleEvents=True,
-                        orderBy='startTime'
+                        orderBy='startTime',
                     ).execute()
                 )
-                events = events_result.get('items', [])
-                for event in events:
+                for event in events_result.get('items', []):
                     start_str = event['start'].get('dateTime', event['start'].get('date'))
-                    end_str = event['end'].get('dateTime', event['end'].get('date'))
-                    start_dt = datetime.fromisoformat(start_str.replace('Z', '+00:00')).astimezone(ZoneInfo("Africa/Nairobi"))
-                    end_dt = datetime.fromisoformat(end_str.replace('Z', '+00:00')).astimezone(ZoneInfo("Africa/Nairobi"))
-
+                    end_str   = event['end'].get('dateTime', event['end'].get('date'))
+                    start_dt  = datetime.fromisoformat(start_str.replace('Z', '+00:00')).astimezone(ZoneInfo("Africa/Nairobi"))
+                    end_dt    = datetime.fromisoformat(end_str.replace('Z', '+00:00')).astimezone(ZoneInfo("Africa/Nairobi"))
                     if start_dt <= now <= end_dt:
                         summary = event.get('summary', '').lower()
                         if "deep work" in summary or "ai engineering" in summary:
-                            current_block_id = event['id']
+                            current_block_id   = event['id']
                             current_block_type = "calendar_focus"
                             break
 
-            # Update context state
             previous_block_type = ctx.get("current_block_type")
-            previous_block_id = ctx.get("current_block_id")
-
+            previous_block_id   = ctx.get("current_block_id")
             if current_block_type != previous_block_type or current_block_id != previous_block_id:
                 await update_user_context(
                     self.chat_id,
                     current_block_type=current_block_type,
-                    current_block_id=current_block_id
+                    current_block_id=current_block_id,
                 )
                 reason = f"Block state transition: {previous_block_type} -> {current_block_type}"
                 print(f"🔄 {reason} ({current_block_id})")
@@ -737,21 +812,19 @@ class ExecutiveSyncService:
                     }
                 )
 
-            # 3. The 'Suspicious Silence' Nudge
+            # 3. Suspicious Silence nudge — block ended > 15 mins ago, no interaction since
             if not current_block_type:
-                # Check if a block ended recently (more than 15 mins ago)
-                # We use updated_at to see when current_block_type became None
                 updated_at_str = ctx.get("updated_at")
                 if updated_at_str:
                     updated_at = datetime.fromisoformat(updated_at_str)
-                    # If block ended more than 15 mins ago
                     if (now - updated_at) >= timedelta(minutes=15):
-                        # Check if we already nudged for this silence
-                        last_silence_nudge_str = ctx.get("last_suspicious_silence_at")
-                        last_silence_nudge = datetime.fromisoformat(last_silence_nudge_str) if last_silence_nudge_str else datetime.min.replace(tzinfo=ZoneInfo("Africa/Nairobi"))
-
-                        if last_silence_nudge < updated_at:
-                            # Check last interaction
+                        last_silence_str = ctx.get("last_suspicious_silence_at")
+                        last_silence = (
+                            datetime.fromisoformat(last_silence_str)
+                            if last_silence_str
+                            else datetime.min.replace(tzinfo=ZoneInfo("Africa/Nairobi"))
+                        )
+                        if last_silence < updated_at:
                             state = await get_user_state(self.chat_id)
                             last_interaction_str = state.get("last_user_interaction_at")
                             last_interaction = datetime.fromisoformat(last_interaction_str) if last_interaction_str else datetime.min.replace(tzinfo=ZoneInfo("Africa/Nairobi"))
@@ -778,15 +851,20 @@ class ExecutiveSyncService:
             # 4. General Inactivity Nudge (MIA for 6+ hours)
             if 9 <= now.hour <= 21:
                 state = await get_user_state(self.chat_id)
-                last_interaction_str = state.get("last_user_interaction_at")
-                last_interaction = datetime.fromisoformat(last_interaction_str) if last_interaction_str else datetime.min.replace(tzinfo=ZoneInfo("Africa/Nairobi"))
-
-                if (now - last_interaction) >= timedelta(hours=6):
-                    last_inactivity_nudge_str = ctx.get("last_inactivity_nudge_at")
-                    last_inactivity_nudge = datetime.fromisoformat(last_inactivity_nudge_str) if last_inactivity_nudge_str else datetime.min.replace(tzinfo=ZoneInfo("Africa/Nairobi"))
-
-                    if last_inactivity_nudge.date() < now.date():
-                        # Check if there are pending tasks
+                last_int_str = state.get("last_user_interaction_at")
+                last_int = (
+                    datetime.fromisoformat(last_int_str)
+                    if last_int_str
+                    else datetime.min.replace(tzinfo=ZoneInfo("Africa/Nairobi"))
+                )
+                if (now - last_int) >= timedelta(hours=6):
+                    last_inact_str = ctx.get("last_inactivity_nudge_at")
+                    last_inact = (
+                        datetime.fromisoformat(last_inact_str)
+                        if last_inact_str
+                        else datetime.min.replace(tzinfo=ZoneInfo("Africa/Nairobi"))
+                    )
+                    if last_inact.date() < now.date():
                         tasks_resp = await run_in_threadpool(
                             lambda: self.supabase.table("user_tasks")
                             .select("id")
@@ -796,7 +874,7 @@ class ExecutiveSyncService:
                             .execute()
                         )
                         if tasks_resp.data:
-                            msg = "Yo Muchiri, you've been off the radar for a bit. Hope the day's going well! Just a reminder that you've still got some pending tasks when you're back in the zone."
+                            msg  = "Yo Muchiri, you've been off the radar for a bit. Still got pending tasks when you're back."
                             msg += await self._get_vetted_ps()
                             await send_telegram_message(self.chat_id, msg, reminder_type="inactivity_nudge")
                             await update_user_context(self.chat_id, last_inactivity_nudge_at=now.isoformat())
@@ -822,63 +900,177 @@ class ExecutiveSyncService:
 executive_sync_service = ExecutiveSyncService(supabase, pomodoro_service)
 
 
+# ─── Outbound telemetry loop (1-min polling) ───────────────────────────────────
+
 async def outbound_telemetry_loop():
-    """
-    Native non-blocking event loop for proactive outbound messages.
-    Replaces APScheduler with a lightweight asyncio.sleep polling model.
-    """
     print("🚀 Outbound Telemetry Loop started.")
     last_4h_check = datetime.min.replace(tzinfo=ZoneInfo("Africa/Nairobi"))
-    last_8am_check_day = None
 
     while True:
         try:
-            now = datetime.now(ZoneInfo("Africa/Nairobi"))
-
-            # 1. 1-Minute Polling Tasks
             await nudge_engine_service.check_alerts()
             await executive_sync_service.sync_executive_state()
 
-            # 2. 4-Hour Polling Tasks
-            if (now - last_4h_check).total_seconds() >= 14400:  # 4 hours
+            now = datetime.now(ZoneInfo("Africa/Nairobi"))
+            if (now - last_4h_check).total_seconds() >= 14400:
                 await evaluate_project_velocity()
                 await evaluate_habit_velocity()
                 last_4h_check = now
 
-            # 3. Daily 8 AM Task (Nairobi Time)
-            if now.hour == 8 and last_8am_check_day != now.date():
-                await morning_routine_check()
-                last_8am_check_day = now.date()
-
         except asyncio.CancelledError:
-            print("🛑 Outbound Telemetry Loop stopping...")
+            print("🛑 Outbound Telemetry Loop stopping.")
             break
         except Exception as e:
-            print(f"❌ Error in Outbound Telemetry Loop: {e}")
+            print(f"❌ Telemetry loop error: {e}")
 
         await asyncio.sleep(60)
 
 
+# ─── Scheduled wellness nudges ─────────────────────────────────────────────────
+# These fire on a fixed schedule and are NOT subject to interaction suppression.
+# They are spaced by the per-type cooldowns in NUDGE_COOLDOWNS.
+
+HYDRATION_MESSAGES = [
+    "Hydration check. Water, not coffee.",
+    "You need water. Not later — now.",
+    "Drink water. Your brain runs on it.",
+    "Quick break: glass of water. Go.",
+]
+MOVEMENT_MESSAGES = [
+    "Stand up. 5 mins away from the screen.",
+    "Screen break. Walk around, stretch.",
+    "Eyes off the monitor for 5. Move.",
+    "Quick movement break — do it.",
+]
+
+_hydration_idx = 0
+_movement_idx  = 0
+
+
+async def hydration_nudge():
+    global _hydration_idx
+    if not MUCHIRI_CHAT_ID:
+        return
+    msg = HYDRATION_MESSAGES[_hydration_idx % len(HYDRATION_MESSAGES)]
+    _hydration_idx += 1
+    await send_telegram_message(MUCHIRI_CHAT_ID, msg, reminder_type="hydration")
+    print("💧 Hydration nudge sent.")
+
+
+async def movement_nudge():
+    global _movement_idx
+    if not MUCHIRI_CHAT_ID:
+        return
+    msg = MOVEMENT_MESSAGES[_movement_idx % len(MOVEMENT_MESSAGES)]
+    _movement_idx += 1
+    await send_telegram_message(MUCHIRI_CHAT_ID, msg, reminder_type="movement")
+    print("🏃 Movement nudge sent.")
+
+
+# ─── APScheduler jobs ──────────────────────────────────────────────────────────
+
+async def morning_routine_check():
+    msg = "Morning Routine Check: Skincare and Scent. Look like the engineer you're building."
+    await send_telegram_message(MUCHIRI_CHAT_ID, msg, reminder_type="morning_check")
+    print("🌅 Morning routine check sent.")
+
+
+async def evening_review_task():
+    if MUCHIRI_CHAT_ID:
+        review = await generate_evening_review(MUCHIRI_CHAT_ID)
+        await send_telegram_message(MUCHIRI_CHAT_ID, review, reminder_type="evening_review_proactive")
+
+
+async def cleanup_old_records():
+    try:
+        now          = datetime.now(ZoneInfo("Africa/Nairobi")).isoformat()
+        one_day_ago  = (datetime.now(ZoneInfo("Africa/Nairobi")) - timedelta(days=1)).isoformat()
+
+        await run_in_threadpool(
+            lambda: supabase.table("user_schedules").delete().lt("end_time", now).execute()
+        )
+        await run_in_threadpool(
+            lambda: supabase.table("sent_reminders").delete().lt("event_start_time", one_day_ago).execute()
+        )
+        print("🧹 Cleanup completed.")
+    except Exception as e:
+        print(f"Error in cleanup_old_records: {e}")
+
+
+async def check_upcoming_events():
+    try:
+        now = datetime.now(ZoneInfo("Africa/Nairobi"))
+        for window in [15, 5, 0]:
+            target_time = now + timedelta(minutes=window)
+            start_range = (target_time - timedelta(seconds=30)).isoformat()
+            end_range   = (target_time + timedelta(seconds=30)).isoformat()
+
+            res = await run_in_threadpool(
+                lambda: supabase.table("user_schedules")
+                .select("*")
+                .gte("start_time", start_range)
+                .lte("start_time", end_range)
+                .execute()
+            )
+            for event in res.data:
+                chat_id = event.get("chat_id")
+                if not chat_id:
+                    continue
+
+                event_id      = event["event_id"]
+                reminder_type = f"event_reminder_{window}m"
+
+                sent_res = await run_in_threadpool(
+                    lambda: supabase.table("sent_reminders")
+                    .select("id")
+                    .eq("chat_id", chat_id)
+                    .eq("event_id", event_id)
+                    .eq("reminder_type", reminder_type)
+                    .execute()
+                )
+                if not sent_res.data:
+                    briefing = await generate_event_briefing(event, window)
+                    await send_telegram_message(chat_id, briefing, reminder_type=reminder_type)
+                    await run_in_threadpool(
+                        lambda: supabase.table("sent_reminders").insert({
+                            "chat_id": chat_id,
+                            "reminder_type": reminder_type,
+                            "content": briefing,
+                            "event_id": event_id,
+                            "event_start_time": event["start_time"],
+                            "sent_at": datetime.now(ZoneInfo("Africa/Nairobi")).isoformat(),
+                        }).execute()
+                    )
+    except Exception as e:
+        print(f"Error in check_upcoming_events: {e}")
+
+
+# ─── App lifespan ──────────────────────────────────────────────────────────────
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Initialize Telegram Client
     await telegram_client.start()
 
-    # Configure APScheduler
+    # Event-based jobs
     scheduler.add_job(check_upcoming_events, 'interval', seconds=60)
-    scheduler.add_job(morning_briefing_task, CronTrigger(hour=9, minute=0))
-    scheduler.add_job(evening_review_task, CronTrigger(hour=22, minute=0))
-    scheduler.add_job(cleanup_old_records, CronTrigger(hour=3, minute=0))
+    scheduler.add_job(evening_review_task,   CronTrigger(hour=22, minute=0))
+    scheduler.add_job(cleanup_old_records,   CronTrigger(hour=3,  minute=0))
 
-    # Start APScheduler
+    # Wellness nudges — fixed schedule, no interaction dependency
+    scheduler.add_job(morning_routine_check, CronTrigger(hour=7,  minute=30))
+    scheduler.add_job(hydration_nudge,       CronTrigger(hour='10,13,16,19', minute=0))
+    scheduler.add_job(movement_nudge,        CronTrigger(hour='11,14,17',    minute=30))
+
+    # NOTE: morning_briefing_task intentionally removed — handled by
+    # outbound_telemetry_loop → executive_sync_service.sync_executive_state()
+    # to avoid the race condition that was blocking all nudges post-briefing.
+
     scheduler.start()
 
-    # Launch non-blocking background task (legacy or for things not yet in APScheduler)
     telemetry_task = asyncio.create_task(outbound_telemetry_loop())
 
     yield
 
-    # Clean up
     scheduler.shutdown()
     telemetry_task.cancel()
     try:
@@ -886,46 +1078,35 @@ async def lifespan(app: FastAPI):
     except asyncio.CancelledError:
         pass
     await telegram_client.stop()
-    print("🛑 Background tasks and Telegram client shut down.")
+    print("🛑 M-bot shut down cleanly.")
 
 
 app = FastAPI(title="M-bot", lifespan=lifespan)
-# Global clients
 
 
-
+# ─── Utility / storage helpers ─────────────────────────────────────────────────
 
 async def store_project_zayn(data: Dict[str, Any]):
-    """Upsert into 'project_zayn' table."""
     try:
         payload = {
-            "content": data.get("content"),
+            "content":       data.get("content"),
             "skincare_done": data.get("skincare_done", False),
-            "workout_done": data.get("workout_done", False)
+            "workout_done":  data.get("workout_done", False),
         }
-        await run_in_threadpool(
-            supabase.table("project_zayn").upsert(payload).execute
-        )
+        await run_in_threadpool(supabase.table("project_zayn").upsert(payload).execute)
     except Exception as e:
-        print(f"Error storing Project Zayn data: {e}")
+        print(f"Error storing Project Zayn: {e}")
 
 
 async def store_dev_milestone(category: str, data: Dict[str, Any]):
-    """Insert into 'dev_milestones' table."""
     try:
-        payload = {
-            "category": category,
-            "content": data.get("content")
-        }
-        await run_in_threadpool(
-            supabase.table("dev_milestones").insert(payload).execute
-        )
+        payload = {"category": category, "content": data.get("content")}
+        await run_in_threadpool(supabase.table("dev_milestones").insert(payload).execute)
     except Exception as e:
         print(f"Error storing dev milestone: {e}")
 
 
 async def fetch_chat_history(chat_id: str) -> List[Dict[str, str]]:
-    """Fetch the last 15 messages for the current chat_id from Supabase."""
     try:
         response = await run_in_threadpool(
             lambda: supabase.table("messages")
@@ -935,18 +1116,16 @@ async def fetch_chat_history(chat_id: str) -> List[Dict[str, str]]:
             .limit(30)
             .execute()
         )
-        return response.data[::-1]  # chronological order
+        return response.data[::-1]
     except Exception as e:
         print(f"Error fetching chat history: {e}")
         return []
 
 
 async def store_message(chat_id: str, role: str, content: str):
-    """Store a message in the 'messages' table."""
     try:
-        payload = {"chat_id": chat_id, "role": role, "content": content}
         await run_in_threadpool(
-            supabase.table("messages").insert(payload).execute
+            supabase.table("messages").insert({"chat_id": chat_id, "role": role, "content": content}).execute
         )
     except Exception as e:
         print(f"Error storing message: {e}")
@@ -1074,39 +1253,37 @@ async def send_telegram_message(
             if chat_id == MUCHIRI_CHAT_ID and reminder_type:
                 last_nudge_sent_at = datetime.now(ZoneInfo("Africa/Nairobi"))
     except Exception as e:
-        print(f"Error sending Telegram message: {e}")
+        print(f"Error acknowledging: {e}")
 
+
+# ─── AI response helpers ───────────────────────────────────────────────────────
 
 async def generate_personalized_nudge(project_name: str, status: str) -> str:
-    """Generate a personalized nudge using Gemini."""
     try:
-        model = genai.GenerativeModel("gemini-1.5-flash")
-        prompt = f"Given this project ({project_name}) status: {status} and the 25th deadline, write a concise, sharp 1-sentence reminder for a high-performance engineer."
+        model  = genai.GenerativeModel("gemini-1.5-flash")
+        prompt = (
+            f"Project: {project_name}. Status: {status}. "
+            "Write a sharp 1-sentence reminder for a high-performance engineer."
+        )
         response = await model.generate_content_async(prompt)
         return response.text.strip()
     except Exception as e:
-        print(f"Error generating personalized nudge: {e}")
-        return f"Yo Muchiri, don't forget to push updates for {project_name}. Time's ticking!"
+        print(f"Error generating nudge: {e}")
+        return f"Yo Muchiri, push an update for {project_name}. Time's ticking."
 
 
 async def evaluate_project_velocity():
-    """
-    Checks active projects and triggers nudges if velocity is low.
-    Runs every 4 hours via APScheduler.
-    """
     try:
-        now = datetime.now(ZoneInfo("Africa/Nairobi"))
+        now              = datetime.now(ZoneInfo("Africa/Nairobi"))
         twelve_hours_ago = now - timedelta(hours=12)
 
         res = await run_in_threadpool(
             lambda: supabase.table("goals").select("*").eq("status", "active").execute()
         )
-        projects = res.data
-
-        for project in projects:
-            project_id = project["id"]
+        for project in res.data:
+            project_id   = project["id"]
             project_name = project["name"]
-            priority = project.get("priority", 1)
+            priority     = project.get("priority", 1)
 
             log_res = await run_in_threadpool(
                 lambda: supabase.table("activity_logs")
@@ -1116,7 +1293,6 @@ async def evaluate_project_velocity():
                 .limit(1)
                 .execute()
             )
-
             last_update = None
             if log_res.data:
                 last_update = datetime.fromisoformat(log_res.data[0]["created_at"])
@@ -1129,106 +1305,68 @@ async def evaluate_project_velocity():
                     is_stalled = True
 
             if is_stalled:
-                status_desc = f"No updates in over 12 hours."
-                if not last_update:
-                    status_desc = "No activity logs found."
-
+                status_desc = "No updates in over 12 hours." if last_update else "No activity logs found."
                 nudge = await generate_personalized_nudge(project_name, status_desc)
                 await send_telegram_message(MUCHIRI_CHAT_ID, nudge, reminder_type="velocity_nudge")
-                print(f"🚀 Velocity nudge sent for project: {project_name}")
-
+                print(f"🚀 Velocity nudge: {project_name}")
     except Exception as e:
         print(f"Error in evaluate_project_velocity: {e}")
 
 
 async def evaluate_habit_velocity():
-    """
-    Checks habit streaks and triggers alerts for breaks.
-    Specifically handles the Dopamine Discipline pillar.
-    """
     try:
         now = datetime.now(ZoneInfo("Africa/Nairobi"))
-        # Habits are checked every 4 hours, but we mainly care if they weren't completed yesterday/today
-        # For simplicity, we check if streak was recently reset or if broken
-        res = await run_in_threadpool(
-            lambda: supabase.table("habits").select("*").execute()
-        )
-        habits = res.data
-
-        for habit in habits:
-            name = habit["name"]
-            streak = habit.get("streak", 0)
-            last_completed = habit.get("last_completed_at")
-
-            if name == "dopamine_integrity" and streak == 0 and last_completed:
-                last_dt = datetime.fromisoformat(last_completed)
-                if (now - last_dt) > timedelta(days=1):
-                    # Streak broken logic (simplified)
-                    msg = "🚨 Systems Failure Alert: Chief, we just hit a bottleneck in the reward center. Resetting counter. Let's get back to the GNN research to stabilize the dopamine loop."
-                    await send_telegram_message(MUCHIRI_CHAT_ID, msg, reminder_type="habit_alert")
-                    print("⚠️ Dopamine Discipline alert sent.")
-
+        res = await run_in_threadpool(lambda: supabase.table("habits").select("*").execute())
+        for habit in res.data:
+            if habit["name"] == "dopamine_integrity" and habit.get("streak", 0) == 0:
+                last_completed = habit.get("last_completed_at")
+                if last_completed:
+                    last_dt = datetime.fromisoformat(last_completed)
+                    if (now - last_dt) > timedelta(days=1):
+                        msg = (
+                            "🚨 Systems Failure Alert: Streak reset. "
+                            "Back to the GNN research to stabilise the dopamine loop."
+                        )
+                        await send_telegram_message(MUCHIRI_CHAT_ID, msg, reminder_type="habit_alert")
+                        print("⚠️ Dopamine discipline alert sent.")
     except Exception as e:
         print(f"Error in evaluate_habit_velocity: {e}")
 
 
-async def morning_routine_check():
-    """Daily 8 AM routine check."""
-    msg = "Morning Routine Check: Skincare and Scent. Look like the Engineer you're building."
-    await send_telegram_message(MUCHIRI_CHAT_ID, msg, reminder_type="morning_check")
-    print("🌅 Morning routine check sent.")
-
-
 async def generate_event_briefing(event: Dict[str, Any], window_mins: int) -> str:
-    """Generate an AI briefing for an upcoming event."""
-    chat_id = event.get("chat_id")
-    now_nairobi = datetime.now(ZoneInfo("Africa/Nairobi")).strftime("%Y-%m-%d %H:%M:%S")
-
-    start_dt = datetime.fromisoformat(event["start_time"].replace('Z', '+00:00')).astimezone(ZoneInfo("Africa/Nairobi"))
-    time_str = start_dt.strftime("%I:%M %p")
-
-    window_text = f"in {window_mins} minutes" if window_mins > 0 else "now"
+    now_str  = datetime.now(ZoneInfo("Africa/Nairobi")).strftime("%Y-%m-%d %H:%M:%S")
+    start_dt = datetime.fromisoformat(
+        event["start_time"].replace('Z', '+00:00')
+    ).astimezone(ZoneInfo("Africa/Nairobi"))
+    time_str     = start_dt.strftime("%I:%M %p")
+    window_text  = f"in {window_mins} minutes" if window_mins > 0 else "now"
     location_text = f"\n📍 Location: {event['location']}" if event.get("location") else ""
 
     prompt = (
-        f"Context: It's {now_nairobi}. An event is starting {window_text}.\n\n"
-        f"Event Title: {event['summary']}\n"
-        f"Start Time: {time_str}\n"
-        f"Description: {event.get('description', 'No description provided.')}\n"
-        f"{location_text}\n\n"
-        "Generate a sharp, proactive briefing in this exact format:\n"
-        "🚨 Upcoming Event: [Title]\n"
-        "Starts: [Time] ([Window Text])\n"
-        "[Location if available]\n\n"
-        "Objectives:\n"
-        "• [Extracted or inferred objective 1]\n"
-        "• [Extracted or inferred objective 2]\n\n"
-        "Suggested Focus:\n"
-        "[A concise, high-impact suggestion on what to prioritize first.]"
+        f"Context: It's {now_str}. Event starting {window_text}.\n\n"
+        f"Title: {event['summary']}\nStart: {time_str}\n"
+        f"Description: {event.get('description', 'None.')}\n{location_text}\n\n"
+        "Generate a sharp proactive briefing:\n"
+        "🚨 Upcoming Event: [Title]\nStarts: [Time] ([Window])\n[Location]\n\n"
+        "Objectives:\n• [obj 1]\n• [obj 2]\n\nSuggested Focus:\n[One sharp sentence.]"
     )
-
     try:
-        # We use Gemini directly for proactive briefings to keep it sharp
-        model = genai.GenerativeModel("gemini-1.5-flash")
+        model    = genai.GenerativeModel("gemini-1.5-flash")
         response = await model.generate_content_async(prompt)
         return response.text.strip()
     except Exception as e:
         print(f"Error generating event briefing: {e}")
-        # Fallback to a basic template
         return (
             f"🚨 Upcoming Event: {event['summary']}\n"
-            f"Starts: {time_str} ({window_text}){location_text}\n\n"
-            "Bro, get ready for this event. Time to focus."
+            f"Starts: {time_str} ({window_text}){location_text}\n\nGet focused."
         )
 
 
 async def generate_morning_briefing(chat_id: str) -> str:
-    """Generate a comprehensive morning briefing."""
-    now = datetime.now(ZoneInfo("Africa/Nairobi"))
-    start_of_day = now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
-    end_of_day = now.replace(hour=23, minute=59, second=59, microsecond=999999).isoformat()
+    now          = datetime.now(ZoneInfo("Africa/Nairobi"))
+    start_of_day = now.replace(hour=0,  minute=0,  second=0,  microsecond=0).isoformat()
+    end_of_day   = now.replace(hour=23, minute=59, second=59, microsecond=999999).isoformat()
 
-    # 1. Fetch events
     events_res = await run_in_threadpool(
         lambda: supabase.table("user_schedules")
         .select("*")
@@ -1238,8 +1376,6 @@ async def generate_morning_briefing(chat_id: str) -> str:
         .order("start_time")
         .execute()
     )
-
-    # 2. Fetch high-priority tasks
     tasks_res = await run_in_threadpool(
         lambda: supabase.table("user_tasks")
         .select("*")
@@ -1249,43 +1385,27 @@ async def generate_morning_briefing(chat_id: str) -> str:
         .execute()
     )
 
-    events_data = events_res.data or []
-    tasks_data = tasks_res.data or []
-
     prompt = (
-        f"Context: It's {now.strftime('%A, %B %d, %Y')} at 9:00 AM. Time for the morning briefing.\n\n"
-        f"Today's Events: {json.dumps(events_data)}\n"
-        f"High-Priority Pending Tasks: {json.dumps(tasks_data)}\n\n"
-        "Generate a morning briefing with these sections:\n"
-        "1. Summary of today's schedule (scannable list).\n"
-        "2. Highlight 2-3 high-priority tasks to crush.\n"
-        "3. Identify free time blocks for deep work.\n\n"
-        "Tone: Senior executive assistant. Sharp, encouraging, focused on productivity."
+        f"It's {now.strftime('%A, %B %d, %Y')} at 9:00 AM.\n\n"
+        f"Events: {json.dumps(events_res.data or [])}\n"
+        f"High-priority tasks: {json.dumps(tasks_res.data or [])}\n\n"
+        "Morning briefing: scannable schedule, top 2-3 tasks, free deep-work blocks. "
+        "Tone: senior executive assistant, sharp, no fluff."
     )
-
     try:
-        model = genai.GenerativeModel("gemini-1.5-flash")
+        model    = genai.GenerativeModel("gemini-1.5-flash")
         response = await model.generate_content_async(prompt)
         return response.text.strip()
     except Exception as e:
         print(f"Error generating morning briefing: {e}")
-        return "Morning! You've got a busy day ahead. Check your calendar and crush those tasks."
-
-
-async def morning_briefing_task():
-    """APScheduler task: Send daily morning briefing at 9:00 AM."""
-    if MUCHIRI_CHAT_ID:
-        briefing = await generate_morning_briefing(MUCHIRI_CHAT_ID)
-        await send_telegram_message(MUCHIRI_CHAT_ID, briefing, reminder_type="morning_briefing_proactive")
+        return "Morning! Busy day ahead. Check the calendar and crush those tasks."
 
 
 async def generate_evening_review(chat_id: str) -> str:
-    """Generate an evening review and productivity summary."""
-    now = datetime.now(ZoneInfo("Africa/Nairobi"))
-    start_of_day = now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
-    end_of_day = now.replace(hour=23, minute=59, second=59, microsecond=999999).isoformat()
+    now          = datetime.now(ZoneInfo("Africa/Nairobi"))
+    start_of_day = now.replace(hour=0,  minute=0,  second=0,  microsecond=0).isoformat()
+    end_of_day   = now.replace(hour=23, minute=59, second=59, microsecond=999999).isoformat()
 
-    # 1. Fetch today's events
     events_res = await run_in_threadpool(
         lambda: supabase.table("user_schedules")
         .select("*")
@@ -1294,8 +1414,6 @@ async def generate_evening_review(chat_id: str) -> str:
         .lte("start_time", end_of_day)
         .execute()
     )
-
-    # 2. Fetch tasks completed today or still pending
     tasks_res = await run_in_threadpool(
         lambda: supabase.table("user_tasks")
         .select("*")
@@ -1305,30 +1423,19 @@ async def generate_evening_review(chat_id: str) -> str:
     )
 
     prompt = (
-        f"Context: It's {now.strftime('%A, %B %d, %Y')} at 10:00 PM. Time for the evening review.\n\n"
-        f"Today's Events: {json.dumps(events_res.data)}\n"
-        f"Tasks Interaction: {json.dumps(tasks_res.data)}\n\n"
-        "Generate an evening review that:\n"
-        "1. Summarizes the day's achievements based on the schedule and tasks.\n"
-        "2. Asks Elvis what he completed from his goals today.\n"
-        "3. Provides a concise 'Productivity Summary' and a score (1-10) for the day.\n\n"
-        "Tone: Reflective, senior executive assistant, encouraging growth."
+        f"It's {now.strftime('%A, %B %d, %Y')} at 10:00 PM.\n\n"
+        f"Today's events: {json.dumps(events_res.data)}\n"
+        f"Tasks: {json.dumps(tasks_res.data)}\n\n"
+        "Evening review: achievements, ask what Elvis completed, productivity score 1-10. "
+        "Tone: reflective, encouraging, senior EA."
     )
-
     try:
-        model = genai.GenerativeModel("gemini-1.5-flash")
+        model    = genai.GenerativeModel("gemini-1.5-flash")
         response = await model.generate_content_async(prompt)
         return response.text.strip()
     except Exception as e:
         print(f"Error generating evening review: {e}")
-        return "Evening, Elvis! How was your day? Tell me what you crushed today so I can log it."
-
-
-async def evening_review_task():
-    """APScheduler task: Send daily evening review at 10:00 PM."""
-    if MUCHIRI_CHAT_ID:
-        review = await generate_evening_review(MUCHIRI_CHAT_ID)
-        await send_telegram_message(MUCHIRI_CHAT_ID, review, reminder_type="evening_review_proactive")
+        return "Evening, Elvis! How was your day? Tell me what you crushed."
 
 
 async def cleanup_old_records():
@@ -1463,94 +1570,77 @@ async def check_upcoming_events():
     except Exception as e:
         print(f"Error in check_upcoming_events: {e}")
 
+# ─── LLM response ─────────────────────────────────────────────────────────────
 
 async def get_llm_response(prompt: str) -> str:
-    """Get response from Gemini with tool calling support, fallback to Groq."""
-    chat_id = current_chat_id.get()
-    history = await fetch_chat_history(chat_id)
+    chat_id     = current_chat_id.get()
+    history     = await fetch_chat_history(chat_id)
     now_nairobi = datetime.now(ZoneInfo("Africa/Nairobi")).strftime("%Y-%m-%d %H:%M:%S")
+
+    system_instruction = (
+        f"Current time: {now_nairobi} (Africa/Nairobi)\n\n"
+        "You are M-bot, the personal AI assistant of Elvis Muchiri — a QA Engineer, "
+        "AI builder, and ambitious guy based in Kenya. "
+        "You're that one brilliant friend who has their life together and knows everything. "
+        "Smart, casual, occasionally witty, never robotic. Talk like a real person — "
+        "no bullet-point overload, no corporate speak, no fake enthusiasm.\n\n"
+        "Address Elvis naturally: sometimes 'Elvis', sometimes 'bro', 'chief', 'man', 'G' — "
+        "read the room. Health stuff: encouraging but not cheesy. Work mode: sharp and focused. "
+        "Just chatting: match that energy.\n\n"
+        "You track:\n"
+        "- Project Zayn: health, fitness, skincare, workout streak\n"
+        "- Build Mode: technical work, coding, engineering notes\n"
+        "- AI Roadmap: journey to AI Engineering mastery\n"
+        "- Kijiji: side hustles and marketplace activities\n\n"
+        "Rules:\n"
+        "- Never make up data you don't have. Say so plainly.\n"
+        "- Keep it conversational. Match his energy.\n"
+        "- Use markdown when it aids scannability.\n"
+        "- Vary your openers. Don't start the same way twice.\n"
+        "- If he seems stressed, acknowledge it like a friend.\n"
+        "- If he adds a task without an effort/impact score, ask for it.\n"
+        "- If he provides scores, suggest a focus order based on impact/effort."
+    )
 
     if GEMINI_API_KEY:
         try:
-            system_instruction = (
-                f"Current time: {now_nairobi} (Africa/Nairobi)\n\n"
-                "You are M-bot, the personal AI assistant of Elvis Muchiri — a QA Engineer, "
-                "AI builder, and all-round ambitious guy based in Kenya. "
-                "You're basically that one brilliant friend who actually has their life together "
-                "and happens to know everything. Smart, casual, occasionally witty, never robotic. "
-                "You talk like a real person — no bullet point overload, no corporate speak, "
-                "no fake enthusiasm. Just straight up helpful with a personality. "
-                "\n\n"
-                "How you address Elvis: mix it up naturally. Sometimes 'Elvis', sometimes 'bro', "
-                "'chief', 'man', 'G' — read the room based on the message vibe. "
-                "If he's logging health stuff, keep it encouraging but not cheesy. "
-                "If he's in work mode, be sharp and focused. "
-                "If he's just chatting, match that energy. "
-                "\n\n"
-                "You track these areas of his life:\n"
-                "- Project Zayn: his health, fitness, skincare and workout streak\n"
-                "- Build Mode: his technical work, coding and engineering notes\n"
-                "- AI Roadmap: his journey to becoming an AI Engineering expert\n"
-                "- Kijiji: his side hustles and marketplace activities\n"
-                "\n\n"
-                "You have access to tools to fetch his schedule.\n"
-                "\n\n"
-                "Rules:\n"
-                "- Never make up data or stats you don't have. If you don't know, say so plainly.\n"
-                "- Keep responses conversational and natural. Match his energy.\n"
-                "- Feel free to use markdown (like bold or lists) to make information scannable when appropriate.\n"
-                "- Don't start every message the same way. Vary your openers.\n"
-                "- If he seems stressed or tired, acknowledge it like a friend would.\n"
-                "- If he just added a task without providing an effort/impact score, ask him for it.\n"
-                "- If he provides scores, acknowledge it and suggest a focus order based on impact/effort."
-            )
-
             model = genai.GenerativeModel(
                 model_name="gemini-1.5-flash",
                 system_instruction=system_instruction,
-                tools=[get_calendar_events]
+                tools=[get_calendar_events],
             )
-
-            gemini_history = []
-            for msg in history:
-                role = "user" if msg["role"] == "user" else "model"
-                gemini_history.append({"role": role, "parts": [msg["content"]]})
-
-            chat = model.start_chat(history=gemini_history)
+            gemini_history = [
+                {"role": "user" if m["role"] == "user" else "model", "parts": [m["content"]]}
+                for m in history
+            ]
+            chat     = model.start_chat(history=gemini_history)
             response = await chat.send_message_async(prompt)
 
             while response.candidates[0].content.parts[0].function_call:
                 tool_call = response.candidates[0].content.parts[0].function_call
-                result = await dispatcher.dispatch(tool_call)
-                response = await chat.send_message_async(
+                result    = await dispatcher.dispatch(tool_call)
+                response  = await chat.send_message_async(
                     genai.types.Content(
-                        parts=[
-                            genai.types.Part.from_function_response(
-                                name=tool_call.name,
-                                response={"result": result}
-                            )
-                        ]
+                        parts=[genai.types.Part.from_function_response(
+                            name=tool_call.name, response={"result": result}
+                        )]
                     )
                 )
-
             return response.text
         except Exception as e:
             print(f"Gemini error: {e}. Falling back to Groq.")
-            return await get_groq_response(prompt, history)
-    else:
-        return await get_groq_response(prompt, history)
+
+    return await get_groq_response(prompt, history)
 
 
 async def get_groq_response(prompt: str, history: List[Dict[str, str]]) -> str:
-    """Fallback response from Groq llama-3.1-8b-instant."""
     now_nairobi = datetime.now(ZoneInfo("Africa/Nairobi")).strftime("%Y-%m-%d %H:%M:%S")
     try:
         calendar_context = await run_in_threadpool(get_calendar_events)
-        # Don't inject error strings into the prompt — keep it clean
-        if any(phrase in calendar_context.lower() for phrase in ["authentication failed", "couldn't fetch", "check your"]):
+        if any(p in calendar_context.lower() for p in ["authentication failed", "couldn't fetch", "check your"]):
             calendar_section = "Calendar is unavailable right now."
         else:
-            calendar_section = f"His upcoming calendar events:\n{calendar_context}"
+            calendar_section = f"Upcoming events:\n{calendar_context}"
     except Exception as e:
         print(f"Calendar fetch error in Groq fallback: {e}")
         calendar_section = "Calendar is unavailable right now."
@@ -1560,126 +1650,44 @@ async def get_groq_response(prompt: str, history: List[Dict[str, str]]) -> str:
         "content": (
             f"Current time: {now_nairobi} (Africa/Nairobi)\n\n"
             "You are M-bot, the personal AI assistant of Elvis Muchiri — a QA Engineer, "
-            "AI builder, and all-round ambitious guy based in Kenya. "
-            "You're basically that one brilliant friend who actually has their life together "
-            "and happens to know everything. Smart, casual, occasionally witty, never robotic. "
-            "You talk like a real person — no bullet point overload, no corporate speak, "
-            "no fake enthusiasm. Just straight up helpful with a personality. "
-            "\n\n"
-            "How you address Elvis: mix it up naturally. Sometimes 'Elvis', sometimes 'bro', "
-            "'chief', 'man', 'G' — read the room based on the message vibe. "
-            "If he's logging health stuff, keep it encouraging but not cheesy. "
-            "If he's in work mode, be sharp and focused. "
-            "If he's just chatting, match that energy. "
-            "\n\n"
-            "You track these areas of his life:\n"
-            "- Project Zayn: his health, fitness, skincare and workout streak\n"
-            "- Build Mode: his technical work, coding and engineering notes\n"
-            "- AI Roadmap: his journey to becoming an AI Engineering expert\n"
-            "- Kijiji: his side hustles and marketplace activities\n"
-            "\n\n"
-            f"{calendar_section}\n"
-            "\n\n"
-            "Rules:\n"
-            "- Never make up data or stats you don't have. If you don't know, say so plainly.\n"
-            "- Keep responses conversational and natural. Match his energy.\n"
-            "- Feel free to use markdown (like bold or lists) to make information scannable when appropriate.\n"
-            "- Don't start every message the same way. Vary your openers.\n"
-            "- If he seems stressed or tired, acknowledge it like a friend would.\n"
-            "- If he just added a task without providing an effort/impact score, ask him for it.\n"
-            "- If he provides scores, acknowledge it and suggest a focus order based on impact/effort."
-        )
+            "AI builder, ambitious guy in Kenya. Brilliant friend energy. Smart, casual, witty. "
+            "Real talk — no bullet overload, no corporate speak.\n\n"
+            f"{calendar_section}\n\n"
+            "Rules: Never fabricate data. Conversational tone. Match his energy. "
+            "Vary your openers. If he adds a task without scores, ask for them."
+        ),
     }
-
-    messages = [system_message]
-    for msg in history:
-        messages.append({"role": msg["role"], "content": msg["content"]})
+    messages = [system_message] + [{"role": m["role"], "content": m["content"]} for m in history]
     messages.append({"role": "user", "content": prompt})
 
     response = await groq_client.chat.completions.create(
         model="llama-3.1-8b-instant",
-        messages=messages
+        messages=messages,
     )
-
     return response.choices[0].message.content
 
 
-async def acknowledge_most_recent(chat_id: str):
-    """Mark the most recently triggered alarm or task as acknowledged."""
-    try:
-        now = datetime.now(ZoneInfo("Africa/Nairobi"))
-        now_iso = now.isoformat()
-
-        # Update user state
-        await update_user_state(chat_id, last_user_interaction_at=now_iso)
-
-        await run_in_threadpool(
-            lambda: supabase.table("user_alarms")
-            .update({"status": "acknowledged", "acknowledged_at": now_iso})
-            .eq("chat_id", chat_id)
-            .eq("status", "triggered")
-            .execute()
-        )
-        await run_in_threadpool(
-            lambda: supabase.table("user_tasks")
-            .update({"status": "completed", "acknowledged_at": now_iso})
-            .eq("chat_id", chat_id)
-            .neq("triggered_at", None)
-            .execute()
-        )
-    except Exception as e:
-        print(f"Error acknowledging: {e}")
-
-
-async def store_task_or_alarm(chat_id: str, data: Dict[str, Any]):
-    """Insert into 'user_tasks' or 'user_alarms' table."""
-    try:
-        task_type = data.get("task_type", "task")
-        if task_type == "alarm":
-            payload = {
-                "chat_id": chat_id,
-                "alarm_time": data.get("due_date", datetime.now(ZoneInfo("Africa/Nairobi")).isoformat()),
-                "message": data.get("title") or data.get("content")
-            }
-            await run_in_threadpool(
-                supabase.table("user_alarms").insert(payload).execute
-            )
-        else:
-            payload = {
-                "chat_id": chat_id,
-                "title": data.get("title") or data.get("content"),
-                "due_date": data.get("due_date"),
-                "effort_score": data.get("effort_score"),
-                "impact_score": data.get("impact_score")
-            }
-            await run_in_threadpool(
-                supabase.table("user_tasks").insert(payload).execute
-            )
-    except Exception as e:
-        print(f"Error storing task/alarm: {e}")
-
+# ─── Webhook ───────────────────────────────────────────────────────────────────
 
 @app.post("/webhook")
 async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
-    """Handle incoming Telegram updates."""
     try:
-        update = await request.json()
+        update  = await request.json()
         message = update.get("message")
         if not message or "text" not in message:
             return {"status": "No text message to process"}
 
         chat_id = str(message["chat"]["id"])
         user_id = str(message.get("from", {}).get("id", chat_id))
-        text = message["text"]
+        text    = message["text"]
 
         current_chat_id.set(chat_id)
 
-        # Update last interaction in background
         now_iso = datetime.now(ZoneInfo("Africa/Nairobi")).isoformat()
         background_tasks.add_task(update_user_context, chat_id, last_interaction_at=now_iso)
         background_tasks.add_task(update_user_state, chat_id, last_user_interaction_at=now_iso)
 
-        # 0. Brain Dump Pipeline
+        # 0. Brain Dump pipeline
         if text.startswith(".") or "#" in text:
             hashtags = re.findall(r"#(\w+)", text.lower())
             if text.startswith(".") or hashtags:
@@ -1687,55 +1695,73 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
                     brain_dump = BrainDump(
                         raw_content=text,
                         tags=hashtags,
-                        metadata={
-                            "message_id": message.get("message_id"),
-                            "chat_id": chat_id,
-                            "user_id": user_id
-                        }
+                        metadata={"message_id": message.get("message_id"), "chat_id": chat_id, "user_id": user_id},
                     )
                     await run_in_threadpool(
                         lambda: supabase.table("brain_dumps").insert(brain_dump.model_dump()).execute()
                     )
-                    # Use plain text confirmation to avoid markdown errors with hashtags
                     await send_telegram_message(
                         chat_id,
-                        f"🧠 Brain Dump captured. Tags: {', '.join(hashtags) if hashtags else 'none'}. I've got this filed, chief."
+                        f"🧠 Brain Dump captured. Tags: {', '.join(hashtags) if hashtags else 'none'}. Filed, chief.",
                     )
                     return {"status": "success", "type": "brain_dump"}
                 except Exception as e:
-                    print(f"Error in Brain Dump pipeline: {e}")
+                    print(f"Brain Dump error: {e}")
 
-        # 1. Handle Commands
+        # 1. Commands
         if text.startswith("/"):
             message_id = message.get("message_id")
             if text.startswith("/pomodoro"):
                 try:
                     await pomodoro_service.start_session(user_id, chat_id=chat_id)
                     await update_user_state(chat_id, pomodoro_active=True)
-                    await send_telegram_message(chat_id, "🚀 Pomodoro started! 25 minutes of deep work begins now. Focus, bro.")
+                    await send_telegram_message(chat_id, "🚀 Pomodoro started! 25 minutes. Focus.")
                 except Exception as e:
-                    await send_telegram_message(chat_id, f"❌ Pomodoro failed: {str(e)}", reply_to_message_id=message_id)
+                    await send_telegram_message(chat_id, f"❌ Pomodoro failed: {e}", reply_to_message_id=message_id)
                 return {"status": "success", "command": "pomodoro"}
+
             elif text.startswith("/p_stop"):
                 await pomodoro_service.stop_session(user_id)
                 await update_user_state(chat_id, pomodoro_active=False)
-                await send_telegram_message(chat_id, "🛑 Pomodoro stopped. Rest up.")
+                await send_telegram_message(chat_id, "🛑 Pomodoro stopped.")
                 return {"status": "success", "command": "p_stop"}
+
             elif text.startswith("/p_status"):
                 session = await pomodoro_service.get_active_session(user_id)
                 if session:
-                    end_time = datetime.fromisoformat(session["end_time"].replace('Z', '+00:00')).astimezone(ZoneInfo("Africa/Nairobi"))
+                    end_time  = datetime.fromisoformat(session["end_time"].replace('Z', '+00:00')).astimezone(ZoneInfo("Africa/Nairobi"))
                     remaining = end_time - datetime.now(ZoneInfo("Africa/Nairobi"))
-                    minutes = int(remaining.total_seconds() // 60)
-                    await send_telegram_message(chat_id, f"⏳ {minutes} minutes remaining in your current session. Keep pushing!")
+                    minutes   = int(remaining.total_seconds() // 60)
+                    await send_telegram_message(chat_id, f"⏳ {minutes} minutes remaining. Keep pushing.")
                 else:
-                    await send_telegram_message(chat_id, "No active Pomodoro session. Use /pomodoro to start one.")
+                    await send_telegram_message(chat_id, "No active session. Use /pomodoro to start.")
                 return {"status": "success", "command": "p_status"}
+
             elif text.startswith("/mute"):
                 muted_until = (datetime.now(ZoneInfo("Africa/Nairobi")) + timedelta(hours=8)).isoformat()
                 await update_user_state(chat_id, is_muted=True, muted_until=muted_until)
-                await send_telegram_message(chat_id, "🔇 Global Mute active. I'll stay quiet for the next 8 hours, chief. Only alarms will get through.")
+                await send_telegram_message(chat_id, "🔇 Muted for 8 hours. Only alarms get through.")
                 return {"status": "success", "command": "mute"}
+
+            elif text.startswith("/unmute"):
+                await update_user_state(chat_id, is_muted=False, muted_until=None)
+                await send_telegram_message(chat_id, "🔊 Unmuted. I'm back on watch.")
+                return {"status": "success", "command": "unmute"}
+
+            elif text.startswith("/status"):
+                now = datetime.now(ZoneInfo("Africa/Nairobi"))
+                lines = ["📊 Nudge Registry (last fired):"]
+                for ntype, cooldown in NUDGE_COOLDOWNS.items():
+                    last = nudge_sent_registry.get(ntype)
+                    if last:
+                        elapsed = (now - last).total_seconds() / 60
+                        next_in = max(0, cooldown.total_seconds() / 60 - elapsed)
+                        lines.append(f"• {ntype}: {elapsed:.0f}m ago (next in {next_in:.0f}m)")
+                    else:
+                        lines.append(f"• {ntype}: never fired this session")
+                await send_telegram_message(chat_id, "\n".join(lines))
+                return {"status": "success", "command": "status"}
+
             elif text.startswith("/research"):
                 topic = text.replace("/research", "").strip()
                 if topic:
@@ -1744,15 +1770,15 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
                     )
                     await send_telegram_message(chat_id, "Node added. Your intellectual latent space is expanding.")
                 else:
-                    await send_telegram_message(chat_id, "Chief, what topic are we expanding into? Usage: /research [topic]")
+                    await send_telegram_message(chat_id, "Usage: /research [topic]")
                 return {"status": "success", "command": "research"}
 
-        # 2. Classify Intent
+        # 2. Intent classification
+        category = "Unknown"
         try:
             classification = await intent_classifier.classify(text)
-            category = classification.get("category")
+            category       = classification.get("category")
 
-            # 2. Specialized storage based on category
             if category == "Project Zayn":
                 background_tasks.add_task(store_project_zayn, classification)
             elif category in ["Build Mode", "AI Roadmap"]:
@@ -1762,45 +1788,42 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
             elif category == "Acknowledge":
                 background_tasks.add_task(acknowledge_most_recent, chat_id)
             elif category == "Nudge":
-                # Intent Guard: Disable automated nudge if message contains question mark or inquiry words
                 if re.search(r"\?|how|why|what", text, re.IGNORECASE):
-                    print(f"🛡️ Intent Guard: Inquiry detected in nudge request. Skipping automated nudge for '{text}'.")
+                    print(f"🛡️ Intent Guard: Inquiry in nudge request — passing to LLM.")
                 else:
                     nudge_msg = await intent_classifier.get_nudge_message(chat_id)
-                    # Pass the nudge message as a hint to the LLM instead of returning early
                     text = f"[Nudge Hint: {nudge_msg}] {text}"
         except Exception as e:
-            print(f"Classification or specialized storage error: {e}")
-            category = "Unknown"
+            print(f"Classification error: {e}")
 
-        # 3. Generate LLM response
+        # 3. LLM response
         try:
             full_response = await get_llm_response(text)
             await send_telegram_message(chat_id, full_response)
         except Exception as e:
-            print(f"LLM or Telegram error: {e}")
-            full_response = "Sorry bro, I'm having some trouble processing that right now."
+            print(f"LLM error: {e}")
+            full_response = "Sorry bro, having trouble with that right now."
             await send_telegram_message(chat_id, full_response)
 
-        # 4. Store messages in background
         background_tasks.add_task(store_message, chat_id, "user", text)
         background_tasks.add_task(store_message, chat_id, "assistant", full_response)
 
         return {"status": "success", "category": category}
+
     except Exception as e:
-        print(f"Error processing webhook: {e}")
+        print(f"Webhook error: {e}")
         return {"status": "error", "message": str(e)}
 
 
+# ─── Manual nudge endpoint ─────────────────────────────────────────────────────
+
 @app.post("/nudge")
 async def manual_nudge(request: NudgeRequest, background_tasks: BackgroundTasks):
-    """
-    Explicitly trigger a nudge message to Muchiri.
-    """
     if not MUCHIRI_CHAT_ID:
         raise HTTPException(status_code=500, detail="MUCHIRI_CHAT_ID not configured")
-
-    background_tasks.add_task(send_telegram_message, MUCHIRI_CHAT_ID, request.message)
+    background_tasks.add_task(
+        send_telegram_message, MUCHIRI_CHAT_ID, request.message, None, "manual_nudge_request"
+    )
     return {"status": "nudge_enqueued", "message": request.message}
 
 
