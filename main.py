@@ -16,6 +16,7 @@ import re
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from telegram_client import TelegramClient
+from proactive_router import router as proactive_router
 from dotenv import load_dotenv
 from pomodoro_service import PomodoroService
 from intent_classifier import IntentClassifier
@@ -1082,6 +1083,9 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="M-bot", lifespan=lifespan)
+
+# Include Proactive Router
+app.include_router(proactive_router)
 
 
 # ─── Utility / storage helpers ─────────────────────────────────────────────────
