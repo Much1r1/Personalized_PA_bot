@@ -45,6 +45,10 @@ class ProactiveService:
         return res.data[0]
 
     async def increment_nudge(self, log_id: str, new_content: str) -> Dict[str, Any]:
+        try:
+            from zoneinfo import ZoneInfo
+        except ImportError:
+            from backports.zoneinfo import ZoneInfo
         # Fetch current log to get nudge_count
         current = self.supabase.table(self.table).select("nudge_count").eq("id", log_id).execute()
         if not current.data:
@@ -53,7 +57,7 @@ class ProactiveService:
         new_count = current.data[0]["nudge_count"] + 1
         update_data = {
             "nudge_count": new_count,
-            "last_nudge_at": datetime.now().isoformat(),
+            "last_nudge_at": datetime.now(ZoneInfo("Africa/Nairobi")).isoformat(),
             "content": new_content
         }
 
@@ -65,8 +69,12 @@ class ProactiveService:
 
     async def get_dispatch_pending(self) -> List[Dict[str, Any]]:
         # Find dispatched notifications that might need a nudge (e.g., older than 1 hour)
-        from datetime import timedelta, timezone
-        threshold = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+        from datetime import timedelta
+        try:
+            from zoneinfo import ZoneInfo
+        except ImportError:
+            from backports.zoneinfo import ZoneInfo
+        threshold = (datetime.now(ZoneInfo("Africa/Nairobi")) - timedelta(hours=1)).isoformat()
 
         res = self.supabase.table(self.table)\
             .select("*")\

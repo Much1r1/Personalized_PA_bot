@@ -299,35 +299,59 @@ def get_google_creds():
 SCOPES = ['https://www.googleapis.com/auth/calendar.readonly']
 
 
-def get_calendar_events(max_results: int = 5) -> str:
+async def get_calendar_events(max_results: int = 5, until_time: Optional[str] = None) -> str:
+    """
+    Fetch the user's schedule from the database with strict chronological filtering and ordering.
+    Standardized to Africa/Nairobi timezone.
+    """
     try:
-        creds = get_google_creds()
-        if not creds:
-            return "Authentication failed. Check your Google Calendar connection."
-
-        service = build('calendar', 'v3', credentials=creds)
         now_nairobi = datetime.now(ZoneInfo("Africa/Nairobi"))
-        events_result = service.events().list(
-            calendarId='primary',
-            timeMin=now_nairobi.isoformat(),
-            maxResults=max_results,
-            singleEvents=True,
-            orderBy='startTime',
-        ).execute()
+        now_nairobi_iso = now_nairobi.isoformat()
 
-        events = events_result.get('items', [])
+        # Compute the end-of-day target time localized strictly to 23:00:00 EAT
+        if until_time and ":" in until_time:
+            try:
+                hour, minute = map(int, until_time.split(':'))
+                target_until = now_nairobi.replace(hour=hour, minute=minute, second=0, microsecond=0)
+            except ValueError:
+                target_until = now_nairobi.replace(hour=23, minute=0, second=0, microsecond=0)
+        else:
+            target_until = now_nairobi.replace(hour=23, minute=0, second=0, microsecond=0)
+
+        # Query Supabase with strict filtering and ordering
+        res = await run_in_threadpool(
+            lambda: supabase.table("user_schedules").select("*")
+            .gte("start_time", now_nairobi_iso)
+            .lte("start_time", target_until.isoformat())
+            .order("start_time", desc=False)
+            .limit(max_results)
+            .execute()
+        )
+
+        events = res.data
         if not events:
             return "No upcoming events found."
 
-        event_list = []
+        lines = ["[CHRONOLOGICAL TIMELINE]"]
         for event in events:
-            start = event['start'].get('dateTime', event['start'].get('date'))
-            display_time = start.split('T')[1][:5] if 'T' in start else "All Day"
-            event_list.append(f"- {display_time}: {event.get('summary')}")
+            start_str = event["start_time"]
+            end_str = event["end_time"]
+            summary = event.get("summary", "No Title")
 
-        return "\n".join(event_list)
+            # Parse times to local Nairobi for display
+            start_dt = datetime.fromisoformat(start_str.replace('Z', '+00:00')).astimezone(ZoneInfo("Africa/Nairobi"))
+            end_dt = datetime.fromisoformat(end_str.replace('Z', '+00:00')).astimezone(ZoneInfo("Africa/Nairobi"))
+
+            status = "UPCOMING"
+            if start_dt <= now_nairobi <= end_dt:
+                status = "ACTIVE"
+
+            display_time = start_dt.strftime("%H:%M")
+            lines.append(f"• {display_time} - {summary} ({status})")
+
+        return "\n".join(lines)
     except Exception as e:
-        print(f"Calendar API Error: {e}")
+        print(f"Calendar Database Error: {e}")
         return "Couldn't fetch your schedule right now, bro."
 
 
@@ -363,8 +387,8 @@ async def get_scannable_briefing(chat_id: str) -> str:
         return "Couldn't pull your scannable briefing right now."
 
 
-def get_schedule(max_results: int = 5) -> str:
-    return get_calendar_events(max_results)
+async def get_schedule(max_results: int = 5) -> str:
+    return await get_calendar_events(max_results)
 
 
 # ─── Pydantic models ───────────────────────────────────────────────────────────
@@ -1583,6 +1607,9 @@ async def get_llm_response(prompt: str) -> str:
 
     system_instruction = (
         f"Current time: {now_nairobi} (Africa/Nairobi)\n\n"
+        "CRITICAL: You must strictly follow the [CHRONOLOGICAL TIMELINE] provided. "
+        "Do not suggest or mention events that occurred in the past relative to the 'Current time' provided in this prompt. "
+        "Process events only in the forward-moving order shown.\n\n"
         "You are M-bot, the personal AI assistant of Elvis Muchiri — a QA Engineer, "
         "AI builder, and ambitious guy based in Kenya. "
         "You're that one brilliant friend who has their life together and knows everything. "
@@ -1640,7 +1667,7 @@ async def get_llm_response(prompt: str) -> str:
 async def get_groq_response(prompt: str, history: List[Dict[str, str]]) -> str:
     now_nairobi = datetime.now(ZoneInfo("Africa/Nairobi")).strftime("%Y-%m-%d %H:%M:%S")
     try:
-        calendar_context = await run_in_threadpool(get_calendar_events)
+        calendar_context = await get_calendar_events()
         if any(p in calendar_context.lower() for p in ["authentication failed", "couldn't fetch", "check your"]):
             calendar_section = "Calendar is unavailable right now."
         else:
@@ -1653,6 +1680,9 @@ async def get_groq_response(prompt: str, history: List[Dict[str, str]]) -> str:
         "role": "system",
         "content": (
             f"Current time: {now_nairobi} (Africa/Nairobi)\n\n"
+            "CRITICAL: You must strictly follow the [CHRONOLOGICAL TIMELINE] provided. "
+            "Do not suggest or mention events that occurred in the past relative to the 'Current time' provided in this prompt. "
+            "Process events only in the forward-moving order shown.\n\n"
             "You are M-bot, the personal AI assistant of Elvis Muchiri — a QA Engineer, "
             "AI builder, ambitious guy in Kenya. Brilliant friend energy. Smart, casual, witty. "
             "Real talk — no bullet overload, no corporate speak.\n\n"

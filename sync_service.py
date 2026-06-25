@@ -70,9 +70,15 @@ async def google_callback(code: str):
 
 async def sync_google_calendar():
     """Polls Google Calendar and upserts into Supabase user_schedules."""
+    try:
+        from zoneinfo import ZoneInfo
+    except ImportError:
+        from backports.zoneinfo import ZoneInfo
+
     while True:
         try:
-            print(f"[{datetime.now()}] Starting Google Calendar Sync...")
+            now_nairobi = datetime.now(ZoneInfo("Africa/Nairobi"))
+            print(f"[{now_nairobi}] Starting Google Calendar Sync...")
 
             start_time = time.perf_counter()
             try:
